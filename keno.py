@@ -198,47 +198,49 @@ class SoundEngine:
 
 
 # ─── Payout multiplier table ──────────────────────────────────────────────────
-# Values are multipliers applied to the bet (e.g. 3 → win 3× your bet).
-# Jackpot-tier full catches use the progressive jackpot instead of a multiplier.
-# The jackpot display/payoff is scaled by bet so lesser catches cannot exceed it.
+# Values are bet multipliers (win = catch_mult × bet).
+# Full-catch rows on jackpot tiers use multiplier 0 — the progressive pot pays instead.
+# Odds calibrated to realistic video keno house-edge (~25–30%).
+# 0-catch bonus: picks 7-10 pay a small amount for catching nothing.
 PAYOUTS = {
-    1:  {1: 3},
-    2:  {2: 12,    1: 1},
-    3:  {3: 45,    2: 5,    1: 1},
-    4:  {4: 120,   3: 10,   2: 2},
-    5:  {5: 450,   4: 20,   3: 3,   2: 1},
-    6:  {6: 1500,  5: 50,   4: 8,   3: 2},
-    7:  {7: 5000,  6: 100,  5: 15,  4: 3,  3: 1},
-    8:  {8: 0,     7: 500,  6: 50,  5: 12, 4: 2},         # 8-of-8 → jackpot
-    9:  {9: 0,     8: 2000, 7: 100, 6: 20, 5: 5,  4: 1},  # 9-of-9 → jackpot
-    10: {10: 0,    9: 5000, 8: 500, 7: 50, 6: 10, 5: 2, 4: 1, 3: 1},  # 10 → jackpot
+    1:  {1: 2},
+    2:  {2: 5,      1: 1},
+    3:  {3: 25,     2: 3},
+    4:  {4: 75,     3: 5,    2: 1},
+    5:  {5: 300,    4: 12,   3: 2,   2: 1},
+    6:  {6: 1000,   5: 35,   4: 5,   3: 1},
+    7:  {7: 0,      6: 75,   5: 8,   4: 2,  3: 1,  0: 1},
+    8:  {8: 0,      7: 300,  6: 30,  5: 6,  4: 1,  0: 2},
+    9:  {9: 0,      8: 1000, 7: 60,  6: 12, 5: 2,  4: 1, 0: 3},
+    10: {10: 0,     9: 3000, 8: 200, 7: 25, 6: 5,  5: 1, 4: 1, 0: 5},
 }
 
-BASE_BET = 1   # reference bet the jackpot seeds are calibrated to
-
-
 # ─── Progressive jackpot seeds & contribution rate ────────────────────────────
-# Seeds are calibrated to BASE_BET=1. At higher bets the seed scales linearly.
-JACKPOT_SEEDS   = {8: 5_000,  9: 15_000,  10: 50_000}
-JACKPOT_CONTRIB = 0.02   # fraction of every bet added to each pot
+# Every pick count 1-10 has its own jackpot tier (full catch wins the pot).
+# Seeds scale with pick difficulty — harder to hit = larger seed.
+# Pots are stored and paid at face value regardless of current bet size;
+# the 2% contribution per bet is the only bet-dependent factor.
+JACKPOT_SEEDS = {
+    1:  200,
+    2:  500,
+    3:  1_000,
+    4:  2_500,
+    5:  5_000,
+    6:  10_000,
+    7:  20_000,
+    8:  40_000,
+    9:  80_000,
+    10: 150_000,
+}
+JACKPOT_CONTRIB = 0.02   # fraction of each bet fed into every pot
 
 
-def jackpot_seed_for_bet(tier: int, bet: int) -> int:
-    """Return the reset seed for `tier` scaled to the current bet."""
-    return JACKPOT_SEEDS[tier] * max(1, bet)
-
-
-def jackpot_value_for_bet(pots: dict[int, int], tier: int, bet: int) -> int:
-    """Return the displayed/payable jackpot for a tier at the current bet.
-
-    Jackpot pots are stored as base credit amounts, while normal payouts scale
-    by bet. Scaling the jackpot floor by bet keeps the jackpot above every
-    lesser catch payout, so a near-jackpot result can never pay more than the
-    jackpot itself.
-    """
+def jackpot_value_for_bet(pots: dict[int, int], tier: int, bet: int = 1) -> int:
+    """Return the current jackpot value for a tier (face value, not bet-scaled)."""
     if tier not in JACKPOT_SEEDS:
         return 0
-    return max(int(pots.get(tier, 0)), jackpot_seed_for_bet(tier, bet))
+    return max(int(pots.get(tier, 0)), JACKPOT_SEEDS[tier])
+
 
 _SAVE_PATH = Path.home() / ".keno_save.json"
 
@@ -260,7 +262,6 @@ def _load_jackpots() -> dict[int, int]:
                 for k, v in pots.items() if int(k) in JACKPOT_SEEDS}
     except Exception:
         return {}
-
 
 def _load_balance() -> int:
     try:
@@ -730,248 +731,158 @@ class DmdPanel(QWidget):
                                                 max(1,int(dot)), max(1,int(dot)))
             col_cursor += gw*scale + gap
 
+    def _draw_divider(self, p, gx0, gy0, pitch, dot, row, on_col):
+        """Draw a full-width row of dim dots as a visual divider."""
+        dim = QColor(on_col); dim.setAlpha(60)
+        for col in range(self._dmd_cols):
+            x = gx0 + col * pitch
+            y = gy0 + row * pitch
+            p.setBrush(QBrush(dim)); p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(int(x), int(y), max(1,int(dot)), max(1,int(dot)))
 
-class JackpotPanel(DmdPanel):
-    """Pinball-machine DMD style progressive jackpot display.
 
-    The panel is drawn like a classic amber/orange pinball dot-matrix display:
-    a full field of dim inactive dots, with the jackpot tier and jackpot amount
-    drawn by lighting dot clusters. This avoids font-mask and alpha-sampling
-    problems and guarantees the jackpot amount is visible.
+class GameStatePanel(DmdPanel):
+    """Amber DMD panel — always visible, always shows game state.
+
+    IDLE   — large balance display + game title
+    DRAW   — hit-dot tracker (one dot per player pick, lights up on each match)
+    RESULT — WIN + amount (green) or NO WIN (dim) for 2.5 s, then reverts to idle
     """
 
-    # Animation tick rates (ms) — inherited from DmdPanel
-
     def __init__(self, parent=None):
-        super().__init__(parent=parent)  # DmdPanel handles idle timer + glyphs
+        super().__init__(parent=parent)
         self.setFixedWidth(185)
+        self.setFixedHeight(104)
 
-        self._tier: int | None = None
-        self._value: int = 0
-        self._displayed_value: int = 0
-        self._is_winner: bool = False
+        # ── Shared state ─────────────────────────────────────────────────
+        self._balance:   int = 0
+        self._spots:     int = 0    # number of picks this round
+        self._hits:      int = 0    # hits so far (draw mode)
+        self._hit_list:  list[bool] = []   # ordered: True = hit, False = miss
 
-        # ── Odometer roll ────────────────────────────────────────────────
-        self._digit_states: list[list] = []
-        self._roll_timer = QTimer(self)
-        self._roll_timer.timeout.connect(self._tick_roll)
+        # ── Mode ─────────────────────────────────────────────────────────
+        self._mode: str = "idle"   # "idle" | "draw" | "result"
 
-        # ── Pulse / flicker ──────────────────────────────────────────────
+        # ── Result mode ──────────────────────────────────────────────────
+        self._result_win:    int  = 0
+        self._result_timer = QTimer(self)
+        self._result_timer.setSingleShot(True)
+        self._result_timer.timeout.connect(self._end_result)
+
+        # ── Flicker (used in result-win mode) ────────────────────────────
         self._flicker_phase: float = 0.0
-        self._pulsing: bool = False
         self._flicker_timer = QTimer(self)
         self._flicker_timer.timeout.connect(self._tick_flicker)
 
-        # ── Draw animation (chase border + progress bar) ─────────────────
-        self._draw_anim_active: bool = False
-        self._draw_anim_frame:  int  = 0
-        self._draw_anim_count:  int  = 0
-        self._draw_anim_hits:   int  = 0
-        self._draw_anim_total:  int  = DRAWN_CHIPS_COUNT
-        self._chase_timer = QTimer(self)
-        self._chase_timer.timeout.connect(self._tick_chase)
-
-        # ── Winner cascade + afterglow ───────────────────────────────────
-        self._cascade_step:    int   = -1
-        self._afterglow_alpha: float = 0.0
-        self._afterglow_dir:   int   = 0
-        self._win_timer = QTimer(self)
-        self._win_timer.timeout.connect(self._tick_win)
-
-        # ── Win result display ───────────────────────────────────────────
-        self._result_title:   str  = ""
-        self._result_amount:  int  = 0
-        self._showing_result: bool = False
-        self._result_timer = QTimer(self)
-        self._result_timer.setSingleShot(True)
-        self._result_timer.timeout.connect(self._end_result_display)
-
-        self.setFixedHeight(104)
-
+        # ── Balance odometer ─────────────────────────────────────────────
+        self._bal_displayed: int = 0
+        self._digit_states:  list[list] = []
+        self._roll_timer = QTimer(self)
+        self._roll_timer.timeout.connect(self._tick_roll)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
-    def set_active_tier(self, tier: int | None, value: int):
-        self._tier = tier if (tier in JACKPOT_SEEDS) else None
-        self._is_winner = False
-        self._pulsing = False
-        self._flicker_timer.stop()
-        self._chase_timer.stop()
-        self._draw_anim_active = False
-        self._win_timer.stop()
-        self._cascade_step = -1
-        self._afterglow_alpha = 0.0
-        self._showing_result = False
+    def set_balance(self, balance: int):
+        if balance != self._balance:
+            self._balance = balance
+            if self._mode == "idle":
+                self._start_roll(balance)
+            else:
+                self._set_instant(balance)
+
+    def start_draw(self, spots: int):
+        self._mode    = "draw"
+        self._spots   = spots
+        self._hits    = 0
+        self._hit_list = []
         self._result_timer.stop()
-        self._set_value_instant(value)
-        self.setVisible(self._tier is not None)
-        self.update()
-
-    def update_value(self, value: int):
-        """Roll displayed digits to a new value."""
-        if value == self._value:
-            return
-        self._value = value
-        self._start_odometer_roll(value)
-
-    def pulse(self):
-        """Flicker mode: oscillate brightness when player is close to jackpot."""
-        self._pulsing = True
-        if not self._flicker_timer.isActive():
-            self._flicker_timer.start(self._FLICKER_MS)
-
-    def stop_pulse(self):
-        self._pulsing = False
-        self._flicker_phase = 0.0
         self._flicker_timer.stop()
-        self._is_winner = False
         self.update()
 
-    def start_draw_animation(self, total_draws: int = DRAWN_CHIPS_COUNT):
-        if self._tier is None:
-            return
-        self._draw_anim_active = True
-        self._draw_anim_frame = 0
-        self._draw_anim_count = 0
-        self._draw_anim_hits  = 0
-        self._draw_anim_total = max(1, total_draws)
-        if not self._chase_timer.isActive():
-            self._chase_timer.start(self._CHASE_MS)
+    def register_hit(self, is_hit: bool):
+        """Call for every ball drawn (hit or miss) to update the dot tracker."""
+        self._hit_list.append(is_hit)
+        if is_hit:
+            self._hits += 1
         self.update()
 
-    def update_draw_animation(self, draw_count: int, hit_count: int):
-        self._draw_anim_count = max(0, draw_count)
-        self._draw_anim_hits  = max(0, hit_count)
-        self.update()
-
-    def stop_draw_animation(self):
-        self._chase_timer.stop()
-        self._draw_anim_active = False
-        self._draw_anim_frame  = 0
-        self.update()
-
-    def show_result(self, hits: int, spots: int, winnings: int):
-        """Briefly show catch result and winnings on the DMD, then revert to pot."""
-        self._result_title  = f"CATCH {hits}/{spots}"
-        self._result_amount = winnings
-        self._showing_result = True
-        # Roll the value row to the winnings amount
+    def show_result(self, winnings: int):
+        self._mode       = "result"
+        self._result_win = winnings
+        self._result_timer.start(2500)
         if winnings > 0:
-            self._start_odometer_roll(winnings)
-        self._result_timer.start(3000)
+            self._flicker_phase = 0.0
+            self._flicker_timer.start(self._FLICKER_MS)
         self.update()
 
-    def _end_result_display(self):
-        self._showing_result = False
-        # Roll value row back to the jackpot pot
-        self._start_odometer_roll(self._value)
-        self.update()
+    def stop_draw(self):
+        if self._mode == "draw":
+            self._mode = "idle"
+            self._set_instant(self._balance)
+            self.update()
 
-    def show_winner(self):
-        """Trigger cascade wipe then sustained afterglow."""
+    def _end_result(self):
+        self._mode = "idle"
         self._flicker_timer.stop()
-        self._pulsing = False
-        self._is_winner = True
-        self._cascade_step = 0
-        self._afterglow_alpha = 0.0
-        self._afterglow_dir   = 1
-        if not self._win_timer.isActive():
-            self._win_timer.start(self._AFTERGLOW_MS)
+        self._set_instant(self._balance)
         self.update()
 
     # ── Tick handlers ──────────────────────────────────────────────────────
 
     def _tick_idle_base(self):
-        """Override base: suppress repaint when other animations own the frame."""
         self._breathe_phase = (self._breathe_phase + 0.04) % (2 * math.pi)
         self._scanline_y    = (self._scanline_y    + 0.004) % 1.0
-        if not self._is_winner and not self._pulsing:
+        if self._mode == "idle":
             self.update()
 
     def _tick_flicker(self):
-        """Advance flicker oscillation when pulsing."""
         self._flicker_phase = (self._flicker_phase + 0.18) % (2 * math.pi)
-        self.update()
-
-    def _tick_chase(self):
-        """Advance border chase frame."""
-        self._draw_anim_frame = (self._draw_anim_frame + 1) % 10000
-        self.update()
+        if self._mode == "result":
+            self.update()
 
     def _tick_roll(self):
-        """Advance odometer digit roll — tick each digit toward its target."""
-        DIGIT_ORDER = "0123456789"
-        still_rolling = False
+        DIGITS = "0123456789"
+        still  = False
         for state in self._digit_states:
             disp, target, step = state
             if disp == target:
                 continue
-            still_rolling = True
+            still    = True
             state[2] += 1
-            if state[2] >= self._ROLL_STEPS or disp not in DIGIT_ORDER:
-                state[0] = target
-                state[2] = 0
+            if state[2] >= self._ROLL_STEPS or disp not in DIGITS:
+                state[0] = target; state[2] = 0
             else:
-                idx = (DIGIT_ORDER.index(disp) + 1) % len(DIGIT_ORDER)
-                state[0] = DIGIT_ORDER[idx]
+                state[0] = DIGITS[(DIGITS.index(disp) + 1) % len(DIGITS)]
         self.update()
-        if not still_rolling:
+        if not still:
             self._roll_timer.stop()
-            # Snap displayed value to final
-            self._displayed_value = self._value
-
-    def _tick_win(self):
-        """Cascade wipe columns left→right then hold afterglow, then slow decay."""
-        if self._cascade_step >= 0:
-            self._cascade_step += 3          # advance wipe by 3 dot-columns/tick
-            cols = 104
-            if self._cascade_step > cols:
-                self._cascade_step = -1      # wipe done; switch to glow hold
-                self._afterglow_alpha = 1.0
-                self._afterglow_dir   = 0    # hold
-                # Start slow decay after 1.2 s
-                QTimer.singleShot(1200, self._begin_afterglow_decay)
-        self.update()
-
-    def _begin_afterglow_decay(self):
-        self._afterglow_dir = -1
+            self._bal_displayed = self._balance
 
     # ── Internal helpers ───────────────────────────────────────────────────
 
-    def _set_value_instant(self, value: int):
-        """Set value immediately with no roll animation."""
-        self._value = value
-        self._displayed_value = value
+    def _set_instant(self, value: int):
+        self._bal_displayed = value
         text = format_credits(value)
-        self._digit_states = [[ch, ch, 0] for ch in text]
+        self._digit_states = [[c, c, 0] for c in text]
         self._roll_timer.stop()
 
-    def _start_odometer_roll(self, new_value: int):
-        """Diff old vs new digit string and kick off roll for changed digits."""
-        old_text = format_credits(self._displayed_value)
-        new_text = format_credits(new_value)
-        # Pad shorter string on the left with spaces
-        diff = len(new_text) - len(old_text)
-        if diff > 0:
-            old_text = " " * diff + old_text
-        elif diff < 0:
-            new_text = " " * (-diff) + new_text
-        self._digit_states = [
-            [o, n, 0] for o, n in zip(old_text, new_text)
-        ]
+    def _start_roll(self, new_value: int):
+        old = format_credits(self._bal_displayed)
+        new = format_credits(new_value)
+        diff = len(new) - len(old)
+        if diff > 0:   old = " " * diff + old
+        elif diff < 0: new = " " * (-diff) + new
+        self._digit_states = [[o, n, 0] for o, n in zip(old, new)]
         if not self._roll_timer.isActive():
             self._roll_timer.start(self._ROLL_MS)
 
-    def _current_display_text(self) -> str:
-        return "".join(s[0] for s in self._digit_states) if self._digit_states else format_credits(self._value)
+    def _disp_text(self) -> str:
+        return "".join(s[0] for s in self._digit_states) if self._digit_states \
+               else format_credits(self._balance)
 
-    def _brightness(self) -> float:
-        if self._is_winner:
-            if self._afterglow_dir == -1:
-                self._afterglow_alpha = max(0.0, self._afterglow_alpha - 0.008)
-            return max(0.85, self._afterglow_alpha)
-        if self._pulsing:
-            return 0.60 + 0.40 * (0.5 + 0.5 * math.sin(self._flicker_phase))
+    def _bri(self) -> float:
+        if self._mode == "result" and self._result_win > 0:
+            return 0.70 + 0.30 * (0.5 + 0.5 * math.sin(self._flicker_phase))
         return self._breathe()
 
     # ── Paint ──────────────────────────────────────────────────────────────
@@ -980,92 +891,110 @@ class JackpotPanel(DmdPanel):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
-        bri  = self._brightness()
+        bri  = self._bri()
 
-        border_override = None
-        if self._is_winner:
-            border_override = QColor(
-                68  + int((255 - 68)  * self._afterglow_alpha * 0.9),
-                36  + int((176 - 36) * self._afterglow_alpha * 0.9), 0)
+        on_base   = QColor("#ff7a00"); glow_base = QColor("#b84a00")
+        off_col   = QColor("#2b1202")
+        on_col    = self._scale_bri(on_base,   bri)
+        glow_col  = self._scale_bri(glow_base, bri)
+        dim_on    = self._scale_bri(on_base,   bri * 0.40)
+        dim_glow  = self._scale_bri(glow_base, bri * 0.40)
 
-        if self._is_winner:
-            on_base = QColor("#ffd35a"); glow_base = QColor("#ff9d00")
-        elif self._pulsing:
-            on_base = QColor("#ffbf33"); glow_base = QColor("#ff8c00")
-        else:
-            on_base = QColor("#ff7a00"); glow_base = QColor("#b84a00")
-        off_col  = QColor("#2b1202")
-        on_col   = self._scale_bri(on_base,   bri)
-        glow_col = self._scale_bri(glow_base, bri)
-
-        scanline = not self._is_winner and not self._pulsing
         pitch, dot, gx0, gy0 = self._paint_base(
-            p, W, H, off_col, on_col, border_override=border_override,
-            scanline=scanline)
-        cols = self._dmd_cols
-        rows = self._dmd_rows
+            p, W, H, off_col, on_col,
+            scanline=(self._mode == "idle"))
+        cols = self._dmd_cols   # 104
+        rows = self._dmd_rows   # 32
 
-        # ── Title row ─────────────────────────────────────────────────────
-        if self._showing_result:
-            title = self._result_title
-        elif self._draw_anim_active:
-            drawn  = self._draw_anim_count; hits = self._draw_anim_hits
-            spots  = self._tier or 0;       rem  = self._draw_anim_total - drawn
-            needed = spots - hits
-            if spots > 0 and needed > 0 and needed <= rem <= needed + 2:
-                title = f"NEED {needed} MORE"
+        def txt(text, col, row, sc=1, gap=1, oc=None, gc=None):
+            self._draw_dmd_text(p, text, gx0, gy0, pitch, col, row,
+                                sc, gap, dot, oc or on_col, gc or glow_col)
+
+        def centre(text, row, sc=1, gap=1, oc=None, gc=None):
+            w = self._text_width(text, sc, gap)
+            txt(text, max(0, (cols - w) // 2), row, sc, gap, oc, gc)
+
+        def divider(row):
+            self._draw_divider(p, gx0, gy0, pitch, dot, row, on_col)
+
+        # ──────────────────────────────────────────────────────────────────
+        if self._mode == "idle":
+            # Title: "SUPER KENO" centred, small
+            centre("SUPER KENO", 2, oc=dim_on, gc=dim_glow)
+            divider(10)
+            # Balance: large scale-2 digits centred
+            bal_str = self._disp_text().lstrip()
+            bw = self._text_width(bal_str, 2, 1)
+            txt(bal_str, max(0, (cols - bw) // 2), 13, 2, 1, on_col, glow_col)
+            # "CREDITS" label below
+            centre("CREDITS", 27, oc=dim_on, gc=dim_glow)
+
+        # ──────────────────────────────────────────────────────────────────
+        elif self._mode == "draw":
+            centre("DRAWN BALLS", 2, oc=dim_on, gc=dim_glow)
+            divider(10)
+
+            # Two rows of 10 dots — all 20 drawn balls, in draw order.
+            # Hits glow amber, misses are dim rings, pending are tiny dots.
+            total_slots = 20
+            per_row     = 10
+            margin_frac = 0.05
+            usable_w    = cols * pitch * (1 - 2 * margin_frac)
+            r_dot       = max(2.5, min(5.0, usable_w / (per_row * 2.4)))
+            spacing     = usable_w / per_row
+            x_start     = gx0 + cols * pitch * margin_frac + spacing * 0.5
+            row_y       = [gy0 + 14 * pitch, gy0 + 22 * pitch]
+
+            for i in range(total_slots):
+                row_idx = i // per_row
+                col_idx = i  % per_row
+                cx = x_start + col_idx * spacing
+                cy = row_y[row_idx] + r_dot
+
+                if i < len(self._hit_list):
+                    lit = self._hit_list[i]
+                else:
+                    lit = None
+
+                if lit is True:
+                    gr = QRadialGradient(cx, cy, r_dot * 2.5)
+                    gr.setColorAt(0.0, glow_col); gr.setColorAt(1.0, QColor(0,0,0,0))
+                    p.setBrush(QBrush(gr)); p.setPen(Qt.PenStyle.NoPen)
+                    p.drawEllipse(int(cx-r_dot*2), int(cy-r_dot*2),
+                                  int(r_dot*4), int(r_dot*4))
+                    p.setBrush(QBrush(on_col)); p.setPen(Qt.PenStyle.NoPen)
+                    p.drawEllipse(int(cx-r_dot), int(cy-r_dot),
+                                  int(r_dot*2), int(r_dot*2))
+                elif lit is False:
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    p.setPen(QPen(dim_on, max(1, int(r_dot * 0.35))))
+                    p.drawEllipse(int(cx-r_dot), int(cy-r_dot),
+                                  int(r_dot*2), int(r_dot*2))
+                else:
+                    p.setBrush(QBrush(dim_on)); p.setPen(Qt.PenStyle.NoPen)
+                    p.drawEllipse(int(cx-r_dot*0.4), int(cy-r_dot*0.4),
+                                  int(r_dot*0.8), int(r_dot*0.8))
+
+            divider(27)
+            hits_str = f"{self._hits} HITS"
+            hw = self._text_width(hits_str, 1, 1)
+            txt(hits_str, max(0, (cols - hw) // 2), 29, oc=on_col)
+
+        # ──────────────────────────────────────────────────────────────────
+        elif self._mode == "result":
+            if self._result_win > 0:
+                win_on   = self._scale_bri(QColor("#00ee55"), 1.0)
+                win_glow = self._scale_bri(QColor("#006622"), 1.0)
+                centre("WIN", 2, oc=win_on, gc=win_glow)
+                divider(10)
+                win_str = format_credits(self._result_win)
+                ww = self._text_width(win_str, 2, 1)
+                txt(win_str, max(0, (cols - ww) // 2), 13, 2, 1, win_on, win_glow)
+                centre("CREDITS", 27, oc=dim_on, gc=dim_glow)
             else:
-                title = f"{drawn:02d} DRAWN  {hits} HIT"
-        else:
-            title = f"CATCH {self._tier} JACKPOT" if self._tier else "JACKPOT"
+                centre("NO WIN", rows // 2 - 3, oc=dim_on, gc=dim_glow)
 
-        tw = self._text_width(title, 1, 1)
-        self._draw_dmd_text(p, title, gx0, gy0, pitch,
-                            max(0, (cols - tw) // 2), 3, 1, 1, dot, on_col, glow_col)
-
-        # ── Value row ─────────────────────────────────────────────────────
-        if self._showing_result and self._result_amount > 0:
-            amount = f"+{self._current_display_text().lstrip()}"
-        else:
-            amount = self._current_display_text().lstrip()
-        aw = self._text_width(amount, 2, 1)
-        ac = max(0, (cols - aw) // 2)
-
-        mc = self._cascade_step if self._cascade_step >= 0 else 99999
-        self._draw_dmd_text(p, amount, gx0, gy0, pitch, ac, 14, 2, 1, dot,
-                            on_col, glow_col, max_col=mc)
-
-        if self._is_winner and self._afterglow_alpha > 0.05:
-            bo = QColor(on_col);    bo.setAlpha(int(self._afterglow_alpha * 255))
-            bg = QColor(glow_base); bg.setAlpha(int(self._afterglow_alpha * 180))
-            self._draw_dmd_text(p, amount, gx0, gy0, pitch, ac, 14, 2, 1,
-                                dot * (1.0 + self._afterglow_alpha * 0.6), bo, bg)
-
-        # ── Chase border + progress bar ───────────────────────────────────
-        if self._draw_anim_active:
-            chase_len = 16
-            perim = (cols * 2) + (rows * 2) - 4
-            head  = (self._draw_anim_frame * 3) % perim
-            for step in range(chase_len):
-                idx  = (head - step) % perim; fade = 1.0 - step / chase_len
-                if   idx < cols:                       c2,r2 = idx, 0
-                elif idx < cols+rows-1:                c2,r2 = cols-1, idx-cols+1
-                elif idx < cols+rows-1+cols-1:         c2,r2 = cols-2-(idx-cols-rows+1), rows-1
-                else:                                  c2,r2 = 0, rows-2-(idx-(cols+rows-1+cols-1))
-                cc = QColor(on_col); cc.setAlpha(max(60, int(255*fade)))
-                p.setBrush(QBrush(cc)); p.setPen(Qt.PenStyle.NoPen)
-                p.drawEllipse(int(gx0+c2*pitch), int(gy0+r2*pitch),
-                              max(1,int(dot*1.15)), max(1,int(dot*1.15)))
-            prog   = min(1.0, self._draw_anim_count / max(1, self._draw_anim_total))
-            filled = int((cols - 8) * prog)
-            for c2 in range(4, 4+filled):
-                p.setBrush(QBrush(on_col)); p.setPen(Qt.PenStyle.NoPen)
-                p.drawEllipse(int(gx0+c2*pitch), int(gy0+(rows-3)*pitch),
-                              max(1,int(dot)), max(1,int(dot)))
         p.end()
-
-
-
 
 class PayoutDMD(DmdPanel):
     """Green dot-matrix display replacing the payout table.
@@ -1180,20 +1109,11 @@ class PayoutDMD(DmdPanel):
         rows  = []
         for catch in sorted(table.keys(), reverse=True):
             if catch == self._spots and self._spots in JACKPOT_SEEDS:
-                prize = self._jackpot_val or jackpot_seed_for_bet(self._spots, self._bet)
+                prize = self._jackpot_val or JACKPOT_SEEDS[self._spots]
             else:
                 prize = table[catch] * self._bet * self._prize_mult
             rows.append((catch, prize))
         return rows
-
-    def _draw_divider(self, p, gx0, gy0, pitch, dot, row, on_col):
-        """Draw a full-width row of dim dots as a visual divider."""
-        dim = QColor(on_col); dim.setAlpha(60)
-        for col in range(self._dmd_cols):
-            x = gx0 + col * pitch
-            y = gy0 + row * pitch
-            p.setBrush(QBrush(dim)); p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(int(x), int(y), max(1,int(dot)), max(1,int(dot)))
 
     # ── Paint ──────────────────────────────────────────────────────────────
 
@@ -1393,8 +1313,7 @@ class KenoGame(QMainWindow):
         saved = _load_jackpots()
         self._jackpots: dict[int, int] = {
             t: saved.get(t, s) for t, s in JACKPOT_SEEDS.items()
-        }
-        # Session stats (reset each application launch)
+        }        # Session stats (reset each application launch)
         self._sess_rounds: int = 0
         self._sess_total:  int = 0
         self._sess_best:   int = 0
@@ -1440,8 +1359,8 @@ class KenoGame(QMainWindow):
         rv.setSpacing(10)
 
         self.payout_dmd = PayoutDMD()
-        self.jackpot_panel = JackpotPanel()
-        rv.addWidget(self.jackpot_panel, 0)
+        self.game_state_panel = GameStatePanel()
+        rv.addWidget(self.game_state_panel, 0)
         rv.addWidget(self.payout_dmd, 1)
 
         self.random_pick_btn = CabinetButton("RANDOM 10", "#4499dd", "#ffffff")
@@ -1630,19 +1549,11 @@ class KenoGame(QMainWindow):
             f"color: {'#ffcc00' if n > 0 else '#88aacc'}; background: transparent;"
         )
         prize_multiplier = 3 if self._double_up_active else 1
-        jp_val = jackpot_value_for_bet(self._jackpots, n, self.bet)
+        jp_val = jackpot_value_for_bet(self._jackpots, n)
         self.payout_dmd.update_spots(n, prize_multiplier=prize_multiplier,
                                      jackpot_value=jp_val, bet=self.bet)
         self.payout_dmd.set_balance(self.balance)
-        jp_tier = n if n in JACKPOT_SEEDS else None
-        jp_val  = jackpot_value_for_bet(self._jackpots, n, self.bet) if jp_tier else 0
-        if self.jackpot_panel._tier == jp_tier and jp_tier is not None:
-            # Tier unchanged — roll the digits to the new value
-            self.jackpot_panel.update_value(jp_val)
-            self.jackpot_panel.setVisible(True)
-        else:
-            # Tier changed — snap instantly
-            self.jackpot_panel.set_active_tier(jp_tier, jp_val)
+        self.game_state_panel.set_balance(self.balance)
 
     def _toggle_pick(self, number: int):
         if self.draw_timer.isActive():
@@ -1720,7 +1631,7 @@ class KenoGame(QMainWindow):
         for tier in self._jackpots:
             self._jackpots[tier] += contrib
         _save_state(self._jackpots, self.balance)
-        self.jackpot_panel.stop_pulse()
+        pass  # jackpot panel removed
         self._current_hits = 0
         self._double_up_prompted = False
         self._double_up_active = False
@@ -1739,10 +1650,9 @@ class KenoGame(QMainWindow):
         self.draw_index = 0
         self._set_status("● DRAWING NUMBERS…", "#ffcc00")
         spots = len(self.player_picks)
-        jp_val = jackpot_value_for_bet(self._jackpots, spots, self.bet)
+        jp_val = jackpot_value_for_bet(self._jackpots, spots)
         self.payout_dmd.start_draw(spots, self.bet, 1, jp_val, self.balance)
-        if spots in JACKPOT_SEEDS:
-            self.jackpot_panel.start_draw_animation(len(self.drawn_numbers))
+        self.game_state_panel.start_draw(spots)
         self.draw_timer.start(DRAW_INTERVAL_MS)
 
     def _reveal_next(self):
@@ -1758,15 +1668,10 @@ class KenoGame(QMainWindow):
 
         if is_hit:
             self._current_hits += 1
-            spots = len(self.player_picks)
-            if spots in self._jackpots and self._current_hits >= spots - 2:
-                self.jackpot_panel.pulse()
 
-        # Update draw counters on every ball (hits and misses)
+        # Update dot tracker and draw counters on every ball
+        self.game_state_panel.register_hit(is_hit)
         self.payout_dmd.update_draw(self._current_hits, self.draw_index)
-
-        if len(self.player_picks) in JACKPOT_SEEDS:
-            self.jackpot_panel.update_draw_animation(self.draw_index, self._current_hits)
 
         self._add_drawn_chip(n, is_hit)
         self._sfx.play("hit" if is_hit else "tick")
@@ -1854,7 +1759,7 @@ class KenoGame(QMainWindow):
             self.credit_display.setText(format_credits(self.balance))
             self.bet_display.setText(format_credits(self.bet))
             spots = len(self.player_picks)
-            jp_val = jackpot_value_for_bet(self._jackpots, spots, self.bet)
+            jp_val = jackpot_value_for_bet(self._jackpots, spots)
             self.payout_dmd.start_draw(spots, self.bet, 3, jp_val)
             self.payout_dmd.update_draw(self._current_hits)
             self._set_status(
@@ -1874,30 +1779,25 @@ class KenoGame(QMainWindow):
         hits = len(self.player_picks & drawn_set)
         spots = len(self.player_picks)
 
-        self.jackpot_panel.stop_pulse()
-        self.jackpot_panel.stop_draw_animation()
-        # Keep a final-round payout snapshot before restoring the visible bet.
-        # Without this, a Double Up round briefly shows 3x during the draw, then
-        # _refresh_info() rebuilds the payout table from the restored normal bet.
-        final_table_bet = self.bet
+        pass  # jackpot panel removed
+        self.game_state_panel.stop_draw()
+        final_table_bet        = self.bet
         final_table_multiplier = 3 if self._double_up_active else 1
-        final_table_jackpot = jackpot_value_for_bet(self._jackpots, spots, final_table_bet)
+        final_table_jackpot    = jackpot_value_for_bet(self._jackpots, spots)
 
-        # Check if this is a jackpot win (full catch on a progressive tier)
-        jackpot_win = hits == spots and spots in self._jackpots
+        # Jackpot: full catch on any pick count wins the progressive pot
+        jackpot_win    = (hits == spots) and (spots in self._jackpots)
         jackpot_amount = 0
         if jackpot_win:
-            jackpot_amount = final_table_jackpot
-            self._jackpots[spots] = JACKPOT_SEEDS[spots]
+            jackpot_amount         = final_table_jackpot
+            self._jackpots[spots]  = JACKPOT_SEEDS[spots]   # fixed seed, no bet scaling
             _save_state(self._jackpots, self.balance)
-            self.jackpot_panel.show_winner()
-            self.jackpot_panel.update_value(jackpot_seed_for_bet(spots, final_table_bet))
-            final_table_jackpot = jackpot_seed_for_bet(spots, final_table_bet)
+            final_table_jackpot    = JACKPOT_SEEDS[spots]
 
-        # Payouts are bet multipliers; jackpot top-catch rows have multiplier 0
-        payout_mult = PAYOUTS.get(spots, {}).get(hits, 0)
+        # Fixed-pay tiers: multiplier × bet (jackpot catch row is 0 in table)
+        payout_mult  = PAYOUTS.get(spots, {}).get(hits, 0)
         if jackpot_win:
-            payout_mult = 0   # jackpot_amount covers it entirely
+            payout_mult = 0
         win_multiplier = 3 if self._double_up_active and (payout_mult > 0 or jackpot_win) else 1
         winnings = payout_mult * self.bet * win_multiplier + jackpot_amount
         self.balance += winnings
@@ -1905,22 +1805,15 @@ class KenoGame(QMainWindow):
         if self._double_up_active:
             self.bet = self._bet_before_double_up
 
-        # Refresh only the non-payout displays here.  The payout table is updated
-        # below from the final-round snapshot so it stays on the correct 3x
-        # Double Up values after both wins and losses.
         self.credit_display.setText(format_credits(self.balance))
         self.bet_display.setText(format_credits(self.bet))
         self.picks_display.setText(f"PICKS: {spots} / {self.max_picks}")
         self.picks_display.setStyleSheet(
             f"color: {'#ffcc00' if spots > 0 else '#88aacc'}; background: transparent;"
         )
-        if not jackpot_win:
-            jp_tier = spots if spots in JACKPOT_SEEDS else None
-            self.jackpot_panel.set_active_tier(jp_tier, final_table_jackpot if jp_tier else 0)
 
-        # Show catch result briefly on the DMD if the jackpot panel is visible
-        if spots in JACKPOT_SEEDS and not jackpot_win:
-            self.jackpot_panel.show_result(hits, spots, winnings)
+        # Show WIN/NO WIN on the game state panel
+        self.game_state_panel.show_result(winnings)
 
         self._start_winnings_count(winnings)
 
@@ -1941,6 +1834,7 @@ class KenoGame(QMainWindow):
         self.payout_dmd.show_result(self._sess_rounds, self._sess_total, self._sess_best,
                                     hits, spots, winnings)
 
+
         if jackpot_win:
             msg = f"★★  JACKPOT!  CATCH {hits}  —  {format_credits(jackpot_amount)}  ★★"
             color = "#ffdd33"
@@ -1949,7 +1843,7 @@ class KenoGame(QMainWindow):
                 self, "★  JACKPOT!  ★",
                 f"CATCH {hits} OF {spots}\n\nYOU HIT THE PROGRESSIVE JACKPOT!\n\n"
                 f"  {format_credits(jackpot_amount)} CREDITS  \n\n"
-                f"Jackpot resets to {format_credits(jackpot_seed_for_bet(spots, self.bet))}.",
+                f"Jackpot resets to {format_credits(JACKPOT_SEEDS[spots])}.",
             ))
         elif winnings > 0:
             if win_multiplier > 1:
