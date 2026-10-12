@@ -199,20 +199,21 @@ class SoundEngine:
 
 # ─── Payout multiplier table ──────────────────────────────────────────────────
 # Values are bet multipliers (win = catch_mult × bet).
-# Full-catch rows on jackpot tiers use multiplier 0 — the progressive pot pays instead.
-# Odds calibrated to realistic video keno house-edge (~25–30%).
-# 0-catch bonus: picks 7-10 pay a small amount for catching nothing.
+# Full-catch rows on jackpot tiers (7–10) use multiplier 0 — the progressive pot pays instead.
+# Calibrated for video-keno style fixed-pay RTP ≈ 72–92% (house edge ≈ 8–28%).
+# Progressive 2% contribution + double-up 3× risk keep long-run entertainment edge healthy.
+# 0-catch consolation on picks 7–10 improves hit frequency on higher tickets.
 PAYOUTS = {
-    1:  {1: 2},
-    2:  {2: 5,      1: 1},
-    3:  {3: 25,     2: 3},
-    4:  {4: 75,     3: 5,    2: 1},
-    5:  {5: 300,    4: 12,   3: 2,   2: 1},
-    6:  {6: 1000,   5: 35,   4: 5,   3: 1},
-    7:  {7: 0,      6: 75,   5: 8,   4: 2,  3: 1,  0: 1},
-    8:  {8: 0,      7: 300,  6: 30,  5: 6,  4: 1,  0: 2},
-    9:  {9: 0,      8: 1000, 7: 60,  6: 12, 5: 2,  4: 1, 0: 3},
-    10: {10: 0,     9: 3000, 8: 200, 7: 25, 6: 5,  5: 1, 4: 1, 0: 5},
+    1:  {1: 3},
+    2:  {2: 12},
+    3:  {3: 42,     2: 2},
+    4:  {4: 130,    3: 5,    2: 1},
+    5:  {5: 800,    4: 18,   3: 2},
+    6:  {6: 1800,   5: 70,   4: 6,   3: 1},
+    7:  {7: 0,      6: 280,  5: 22,  4: 3,  3: 1,  0: 1},
+    8:  {8: 0,      7: 700,  6: 55,  5: 12, 4: 2,  0: 2},
+    9:  {9: 0,      8: 2500, 7: 200, 6: 30, 5: 5,  4: 1, 0: 2},
+    10: {10: 0,     9: 5000, 8: 600, 7: 100, 6: 18, 5: 3, 4: 1, 0: 3},
 }
 
 # ─── Progressive jackpot seeds & contribution rate ────────────────────────────
