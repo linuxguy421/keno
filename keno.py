@@ -2,6 +2,7 @@
 
 import json
 import random
+import subprocess
 import sys
 from pathlib import Path
 
@@ -43,159 +44,281 @@ try:
     import numpy as np
     _NUMPY = True
 except ImportError:
+    np = None
     _NUMPY = False
 
 
 class SoundEngine:
-    """Generates and plays procedural sound effects via QSoundEffect.
+    """Game SFX with Qt QSoundEffect primary + PipeWire/Pulse fallback.
 
-    All WAV files are written once to a temp directory at startup and
-    reused for every play call, so there is no per-draw file I/O.
+    On some Arch/KDE setups Qt6 reports zero audioOutputs() (devices: []),
+    so QSoundEffect is silent. In that case we shell out to pw-play / paplay
+    / aplay which use the same PipeWire stack Plasma is already using.
     """
 
     RATE = 22050
+    POOL = 3
+    VOLUME = 0.70
 
     def __init__(self):
         self._tmpdir = tempfile.mkdtemp(prefix="keno_sfx_")
-        self._effects: dict[str, QSoundEffect] = {}
-        if _NUMPY:
+        self._effects: dict[str, list] = {}
+        self._rr: dict[str, int] = {}
+        self._paths: dict[str, str] = {}
+        self._enabled = True
+        self._backend = "none"   # "qt" | "cli" | "none"
+        self._cli_player: list[str] | None = None
+        try:
             self._build_all()
+            if self._try_qt_backend():
+                self._backend = "qt"
+                print("[keno sfx] backend: Qt QSoundEffect", file=sys.stderr)
+            elif self._try_cli_backend():
+                self._backend = "cli"
+                print(f"[keno sfx] backend: CLI {' '.join(self._cli_player)}",
+                      file=sys.stderr)
+            else:
+                self._enabled = False
+                print(
+                    "[keno sfx] no audio backend available "
+                    "(Qt devices empty and no pw-play/paplay/aplay)",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(f"[keno sfx] init failed: {exc}", file=sys.stderr)
+            self._enabled = False
 
-    # ── WAV generation helpers ─────────────────────────────────────────────
+    # ── synthesis ───────────────────────────────────────────────────────
 
     @staticmethod
-    def _to_wav_bytes(samples: "np.ndarray", rate: int) -> bytes:
-        """Convert a float32 numpy array (−1…1) to 16-bit mono WAV bytes."""
-        pcm = np.clip(samples, -1.0, 1.0)
-        pcm16 = (pcm * 32767).astype(np.int16)
+    def _synth_sine(freq, duration, volume=0.4, decay=20.0, rate=22050):
+        n = max(1, int(rate * duration))
+        if _NUMPY:
+            t = np.linspace(0, duration, n, endpoint=False)
+            env = np.exp(-t * decay)
+            return (np.sin(2 * np.pi * freq * t) * env * volume).astype(np.float64)
+        out = []
+        for i in range(n):
+            t = i / rate
+            env = math.exp(-t * decay)
+            out.append(math.sin(2 * math.pi * freq * t) * env * volume)
+        return out
+
+    @classmethod
+    def _mix(cls, *parts):
+        if _NUMPY:
+            longest = max(len(p) for p in parts)
+            acc = np.zeros(longest, dtype=np.float64)
+            for p in parts:
+                acc[:len(p)] += np.asarray(p, dtype=np.float64)
+            peak = float(np.max(np.abs(acc))) or 1.0
+            return acc / peak * 0.85
+        longest = max(len(p) for p in parts)
+        acc = [0.0] * longest
+        for p in parts:
+            for i, v in enumerate(p):
+                acc[i] += v
+        peak = max(abs(v) for v in acc) or 1.0
+        return [v / peak * 0.85 for v in acc]
+
+    @staticmethod
+    def _to_wav_bytes(samples, rate: int) -> bytes:
+        if _NUMPY:
+            pcm = np.clip(np.asarray(samples, dtype=np.float64), -1.0, 1.0)
+            frames = (pcm * 32767).astype(np.int16).tobytes()
+        else:
+            frames = bytearray()
+            for v in samples:
+                v = max(-1.0, min(1.0, float(v)))
+                frames += struct.pack("<h", int(v * 32767))
         buf = io.BytesIO()
         import wave as _wave
         with _wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(rate)
-            wf.writeframes(pcm16.tobytes())
+            wf.writeframes(bytes(frames))
         return buf.getvalue()
 
-    def _save(self, name: str, samples: "np.ndarray"):
+    def _write_wav(self, name: str, samples) -> str:
         path = os.path.join(self._tmpdir, f"{name}.wav")
-        data = self._to_wav_bytes(samples, self.RATE)
         with open(path, "wb") as f:
-            f.write(data)
-        fx = QSoundEffect()
-        fx.setSource(QUrl.fromLocalFile(path))
-        fx.setVolume(0.55)
-        self._effects[name] = fx
-
-    # ── Sound definitions ──────────────────────────────────────────────────
+            f.write(self._to_wav_bytes(samples, self.RATE))
+        self._paths[name] = os.path.abspath(path)
+        return self._paths[name]
 
     def _build_all(self):
         r = self.RATE
-        t_short = np.linspace(0, 0.06, int(r * 0.06), endpoint=False)
-        t_med   = np.linspace(0, 0.12, int(r * 0.12), endpoint=False)
-        t_long  = np.linspace(0, 0.55, int(r * 0.55), endpoint=False)
+        self._write_wav("tick", self._mix(
+            self._synth_sine(880, 0.06, 0.4, 80),
+            self._synth_sine(1320, 0.06, 0.2, 80),
+        ))
+        self._write_wav("hit", self._mix(
+            self._synth_sine(1047, 0.12, 0.5, 35),
+            self._synth_sine(1319, 0.12, 0.3, 35),
+            self._synth_sine(1568, 0.12, 0.2, 35),
+        ))
+        self._write_wav("coin", self._mix(
+            self._synth_sine(1200, 0.06, 0.45, 60),
+            self._synth_sine(2400, 0.06, 0.2, 60),
+        ))
+        notes = [523, 659, 784, 1047]
+        if _NUMPY:
+            fanfare = np.zeros(int(r * 0.55))
+            for i, freq in enumerate(notes):
+                start = i * int(r * 0.10)
+                seg = np.asarray(self._synth_sine(freq, 0.12, 0.5, 18))
+                end = min(start + len(seg), len(fanfare))
+                fanfare[start:end] += seg[: end - start]
+            fanfare = fanfare / (float(np.max(np.abs(fanfare))) or 1.0) * 0.8
+        else:
+            n = int(r * 0.55)
+            fanfare = [0.0] * n
+            for i, freq in enumerate(notes):
+                start = i * int(r * 0.10)
+                for j, v in enumerate(self._synth_sine(freq, 0.12, 0.5, 18)):
+                    if start + j < n:
+                        fanfare[start + j] += v
+            peak = max(abs(v) for v in fanfare) or 1.0
+            fanfare = [v / peak * 0.8 for v in fanfare]
+        self._write_wav("win_fanfare", fanfare)
 
-        # ── tick: soft high-pitched click for a normal (miss) ball drop
-        env_tick = np.exp(-t_short * 80)
-        tick = np.sin(2 * np.pi * 880 * t_short) * env_tick * 0.4
-        tick += np.sin(2 * np.pi * 1320 * t_short) * env_tick * 0.2
-        self._save("tick", tick)
+        chord = [523, 659, 784, 1047, 1319]
+        if _NUMPY:
+            jfan = np.zeros(int(r * 1.2))
+            for i, freq in enumerate(chord):
+                start = i * int(r * 0.08)
+                seg = np.asarray(self._synth_sine(freq, 0.9, 0.4, 3.5))
+                end = min(start + len(seg), len(jfan))
+                jfan[start:end] += seg[: end - start]
+            jfan = jfan / (float(np.max(np.abs(jfan))) or 1.0) * 0.85
+        else:
+            n = int(r * 1.2)
+            jfan = [0.0] * n
+            for i, freq in enumerate(chord):
+                start = i * int(r * 0.08)
+                for j, v in enumerate(self._synth_sine(freq, 0.9, 0.4, 3.5)):
+                    if start + j < n:
+                        jfan[start + j] += v
+            peak = max(abs(v) for v in jfan) or 1.0
+            jfan = [v / peak * 0.85 for v in jfan]
+        self._write_wav("jackpot_fanfare", jfan)
 
-        # ── hit: bright chime for a matching ball drop
-        env_hit = np.exp(-t_med * 35)
-        hit = (
-            np.sin(2 * np.pi * 1047 * t_med) * 0.5
-            + np.sin(2 * np.pi * 1319 * t_med) * 0.3
-            + np.sin(2 * np.pi * 1568 * t_med) * 0.2
-        ) * env_hit
-        self._save("hit", hit)
+        if _NUMPY:
+            broke = np.zeros(int(r * 0.9))
+            for freq, t0 in ((466, 0.0), (370, 0.22), (277, 0.48)):
+                start = int(r * t0)
+                seg = np.asarray(self._synth_sine(freq, 0.28, 0.55, 8))
+                end = min(start + len(seg), len(broke))
+                broke[start:end] += seg[: end - start]
+            broke = broke / (float(np.max(np.abs(broke))) or 1.0) * 0.65
+        else:
+            n = int(r * 0.9)
+            broke = [0.0] * n
+            for freq, t0 in ((466, 0.0), (370, 0.22), (277, 0.48)):
+                start = int(r * t0)
+                for j, v in enumerate(self._synth_sine(freq, 0.28, 0.55, 8)):
+                    if start + j < n:
+                        broke[start + j] += v
+            peak = max(abs(v) for v in broke) or 1.0
+            broke = [v / peak * 0.65 for v in broke]
+        self._write_wav("broke", broke)
 
-        # ── coin: short metallic clink for each winnings counter tick
-        env_coin = np.exp(-t_short * 60)
-        coin = (
-            np.sin(2 * np.pi * 1200 * t_short) * 0.45
-            + np.sin(2 * np.pi * 2400 * t_short) * 0.2
-            + np.random.default_rng(0).uniform(-0.08, 0.08, len(t_short))
-        ) * env_coin
-        self._save("coin", coin)
+    # ── backends ────────────────────────────────────────────────────────
 
-        # ── win_fanfare: ascending arpeggio when winnings count finishes
-        notes = [523, 659, 784, 1047]  # C5 E5 G5 C6
-        fanfare = np.zeros(int(r * 0.55))
-        step = int(r * 0.12)
-        for i, freq in enumerate(notes):
-            start = i * int(r * 0.10)
-            end   = min(start + step, len(fanfare))
-            seg_t = np.linspace(0, (end - start) / r, end - start, endpoint=False)
-            env   = np.exp(-seg_t * 18)
-            fanfare[start:end] += (
-                np.sin(2 * np.pi * freq * seg_t) * 0.45
-                + np.sin(2 * np.pi * freq * 2 * seg_t) * 0.15
-            ) * env
-        fanfare /= np.max(np.abs(fanfare) + 1e-9)
-        fanfare *= 0.75
-        self._save("win_fanfare", fanfare)
+    def _try_qt_backend(self) -> bool:
+        """Return True if Qt can see at least one output and effects load."""
+        try:
+            from PyQt6.QtMultimedia import QMediaDevices
+            outputs = list(QMediaDevices.audioOutputs())
+        except Exception as exc:
+            print(f"[keno sfx] QMediaDevices failed: {exc}", file=sys.stderr)
+            return False
+        if not outputs:
+            print(
+                "[keno sfx] Qt audioOutputs() is empty — "
+                "try: export QT_AUDIO_BACKEND=pulseaudio",
+                file=sys.stderr,
+            )
+            return False
+        audio_device = outputs[0]
+        for d in outputs:
+            if d.isDefault():
+                audio_device = d
+                break
+        print(f"[keno sfx] Qt device: {audio_device.description()}", file=sys.stderr)
+        for name, path in self._paths.items():
+            pool = []
+            url = QUrl.fromLocalFile(path)
+            for _ in range(self.POOL):
+                fx = QSoundEffect()
+                try:
+                    fx.setAudioDevice(audio_device)
+                except Exception:
+                    pass
+                fx.setSource(url)
+                fx.setVolume(self.VOLUME)
+                pool.append(fx)
+            self._effects[name] = pool
+            self._rr[name] = 0
+        return True
 
-        # ── jackpot_fanfare: big triumphant burst for a progressive jackpot win
-        jt = np.linspace(0, 1.2, int(r * 1.2), endpoint=False)
-        chord_freqs = [523, 659, 784, 1047, 1319]  # C E G C E
-        jfanfare = np.zeros(len(jt))
-        for i, freq in enumerate(chord_freqs):
-            start = i * int(r * 0.08)
-            end = len(jt)
-            seg_t = np.linspace(0, (end - start) / r, end - start, endpoint=False)
-            env = np.exp(-seg_t * 3.5)
-            jfanfare[start:end] += (
-                np.sin(2 * np.pi * freq * seg_t) * 0.4
-                + np.sin(2 * np.pi * freq * 2 * seg_t) * 0.15
-                + np.sin(2 * np.pi * freq * 3 * seg_t) * 0.07
-            ) * env
-        # Add a quick drum-hit transient at the start
-        drum_len = int(r * 0.05)
-        rng = np.random.default_rng(42)
-        drum = rng.uniform(-1, 1, drum_len) * np.exp(-np.linspace(0, 1, drum_len) * 30)
-        jfanfare[:drum_len] += drum * 0.35
-        jfanfare /= np.max(np.abs(jfanfare) + 1e-9)
-        jfanfare *= 0.85
-        self._save("jackpot_fanfare", jfanfare)
-
-        # ── broke: descending "wah-wah" — plays when credits are reset silently
-        # Three falling notes with a muted trombone-like tone
-        broke = np.zeros(int(r * 0.9))
-        wah_notes = [(466, 0.0), (370, 0.22), (277, 0.48)]   # Bb4 → F#4 → Db4
-        for freq, t_start in wah_notes:
-            start = int(r * t_start)
-            dur   = int(r * 0.28)
-            end   = min(start + dur, len(broke))
-            seg_t = np.linspace(0, (end - start) / r, end - start, endpoint=False)
-            env   = np.exp(-seg_t * 8) * (1 - np.exp(-seg_t * 60))  # soft attack
-            # slightly detuned harmonics for a "wah" timbre
-            sig = (
-                np.sin(2 * np.pi * freq * seg_t) * 0.55
-                + np.sin(2 * np.pi * freq * 1.5 * seg_t) * 0.20
-                + np.sin(2 * np.pi * freq * 2.0 * seg_t) * 0.10
-            ) * env
-            broke[start:end] += sig
-        broke /= np.max(np.abs(broke) + 1e-9)
-        broke *= 0.65
-        self._save("broke", broke)
-
-    # ── Public play API ────────────────────────────────────────────────────
+    def _try_cli_backend(self) -> bool:
+        """Fall back to PipeWire/Pulse CLI players (works when Qt sees no devices)."""
+        import shutil
+        for cmd in (
+            ["pw-play", "--"],          # PipeWire native
+            ["paplay", "--"],           # Pulse/PipeWire pulse layer
+            ["aplay", "-q"],            # ALSA direct
+        ):
+            if shutil.which(cmd[0]):
+                self._cli_player = cmd
+                return True
+        return False
 
     def play(self, name: str):
-        if not _NUMPY:
+        if not self._enabled:
             return
-        fx = self._effects.get(name)
-        if fx:
-            fx.play()
+        path = self._paths.get(name)
+        if not path:
+            return
+        if self._backend == "qt":
+            pool = self._effects.get(name) or []
+            if not pool:
+                return
+            idx = self._rr[name] % len(pool)
+            self._rr[name] = idx + 1
+            fx = pool[idx]
+            try:
+                if fx.isPlaying():
+                    fx.stop()
+                fx.play()
+            except Exception as exc:
+                print(f"[keno sfx] qt play({name}): {exc}", file=sys.stderr)
+        elif self._backend == "cli" and self._cli_player:
+            try:
+                # Detach so rapid ticks don't block the UI thread
+                subprocess.Popen(
+                    self._cli_player + [path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as exc:
+                print(f"[keno sfx] cli play({name}): {exc}", file=sys.stderr)
 
     def cleanup(self):
+        for pool in self._effects.values():
+            for fx in pool:
+                try:
+                    fx.stop()
+                except Exception:
+                    pass
+        self._effects.clear()
         import shutil
         try:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
         except Exception:
             pass
-
 
 # ─── Payout multiplier table ──────────────────────────────────────────────────
 # Values are bet multipliers (win = catch_mult × bet).
@@ -306,14 +429,43 @@ def _save_jackpots(pots: dict[int, int]) -> None:
 
 
 
+# Display denomination: "credits" (raw) or "cash" ($0.05 per credit)
+DISPLAY_MODE = "credits"
+CREDIT_CASH_VALUE = 0.05   # $0.05 per credit in cash mode
+
+# Bet ladder (1-2-5 style). No hard cap — filtered by current balance at runtime.
+BET_STEPS = [
+    1, 2, 5, 10, 25, 50, 100,
+    250, 500, 1_000, 2_500, 5_000, 10_000,
+    25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000,
+]
+
+
+def set_display_mode(mode: str) -> None:
+    """Switch between credit and cash display. Mode is 'credits' or 'cash'."""
+    global DISPLAY_MODE
+    DISPLAY_MODE = "cash" if mode == "cash" else "credits"
+
+
 def format_credits(amount: int) -> str:
-    """Format an integer amount without currency or credit suffixes."""
+    """Format a credit amount for the current display mode."""
+    if DISPLAY_MODE == "cash":
+        return f"${amount * CREDIT_CASH_VALUE:,.2f}"
     return f"{amount:,}"
 
 
 def format_winnings(amount: int) -> str:
-    """Format winnings with a plus sign for the animated win indicator, without suffixes."""
+    """Format winnings with a plus sign for the animated win indicator."""
+    if DISPLAY_MODE == "cash":
+        return f"+${amount * CREDIT_CASH_VALUE:,.2f}"
     return f"+{amount:,}"
+
+
+def unit_label(plural: bool = True) -> str:
+    """Singular/plural unit name for the current mode."""
+    if DISPLAY_MODE == "cash":
+        return "CASH"
+    return "CREDITS" if plural else "CREDIT"
 
 
 DRAW_INTERVAL_MS = 150
@@ -1109,7 +1261,7 @@ class GameStatePanel(DmdPanel):
             while 2 > 1 and bw > cols - 2:
                 break  # scale-2 is intentional for balance
             txt(bal_str, max(0, (cols - bw) // 2), 13, 2, 1, val_on, val_glow)
-            centre("CREDITS", 27, oc=lbl_on, gc=lbl_glow)
+            centre(unit_label(), 27, oc=lbl_on, gc=lbl_glow)
 
         # ──────────────────────────────────────────────────────────────────
         elif self._mode == "draw":
@@ -1179,7 +1331,7 @@ class GameStatePanel(DmdPanel):
                 win_str = format_credits(self._result_win)
                 ww = self._text_width(win_str, 2, 1)
                 txt(win_str, max(0, (cols - ww) // 2), 13, 2, 1, win_on, win_glow)
-                centre("CREDITS", 27, oc=lbl_on, gc=lbl_glow)
+                centre(unit_label(), 27, oc=lbl_on, gc=lbl_glow)
             else:
                 centre("NO WIN", rows // 2 - 3, oc=self._scale_bri(self._rgb("red"), 0.55),
                        gc=QColor(180, 40, 40, 60))
@@ -1460,7 +1612,7 @@ class PayoutDMD(DmdPanel):
                 divider(19)
                 draw_prize_table(self._prize_rows(), 21, rows - 10)
                 divider(rows - 8)
-                txt("CREDITS", 2, rows - 6, 1, 1, dim_on, dim_glow)
+                txt(unit_label(), 2, rows - 6, 1, 1, dim_on, dim_glow)
                 right(format_credits(self._balance), rows - 6, 1, 1, on_col, glow_col)
 
         p.end()
@@ -1538,7 +1690,7 @@ class DoubleUpOverlay(QWidget):
         self._on_no = on_no
         self._seconds_left = timeout_s
         self.detail.setText(
-            f"Pay another {format_credits(bet_amount)} credits now.\n"
+            f"Pay another {format_credits(bet_amount)} now.\n"
             f"All wins (including jackpot) pay 3× for the rest of this draw."
         )
         self.timer_lbl.setText(f"Auto-declines in {self._seconds_left}s")
@@ -1788,12 +1940,18 @@ class KenoGame(QMainWindow):
         label_row = QHBoxLayout()
         label_row.setSpacing(8)
 
-        lbl = QLabel("CREDITS")
-        lbl.setFont(QFont("Arial", 8, QFont.Weight.Bold))
-        lbl.setStyleSheet(
+        self.balance_lbl = QLabel(unit_label())
+        self.balance_lbl.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+        self.balance_lbl.setStyleSheet(
             "color: #336688; letter-spacing: 3px; background:transparent;"
         )
-        label_row.addWidget(lbl)
+        label_row.addWidget(self.balance_lbl)
+
+        self.mode_btn = self._small_btn("CR", self._toggle_display_mode)
+        self.mode_btn.setToolTip("Toggle Credits / Cash ($0.05 per credit)")
+        self.mode_btn.setFixedWidth(36)
+        label_row.addWidget(self.mode_btn)
+        label_row.addStretch(1)
 
         win_lbl = QLabel("WINNINGS")
         win_lbl.setFont(QFont("Arial", 8, QFont.Weight.Bold))
@@ -1835,7 +1993,7 @@ class KenoGame(QMainWindow):
         self.bet_minus = self._small_btn("◀", self._decrease_bet)
         row.addWidget(self.bet_minus)
         self.bet_display = DigitalLabel(format_credits(1))
-        self.bet_display.setFixedWidth(80)
+        self.bet_display.setFixedWidth(110)
         row.addWidget(self.bet_display)
         self.bet_plus = self._small_btn("▶", self._increase_bet)
         row.addWidget(self.bet_plus)
@@ -1894,8 +2052,10 @@ class KenoGame(QMainWindow):
         self.payout_dmd.set_balance(self.balance)
         self.game_state_panel.set_balance(self.balance)
         self.jackpot_strip.set_jackpot(n, jp_val)
-        if self.bet > self.balance and self.balance > 0:
-            self.bet = max(1, self.balance)
+        if self.balance > 0 and self.bet > self.balance:
+            # Snap to largest ladder step the player can still afford
+            steps = [s for s in BET_STEPS if s <= self.balance]
+            self.bet = steps[-1] if steps else 1
             self.bet_display.setText(format_credits(self.bet))
 
     def _toggle_pick(self, number: int):
@@ -1948,17 +2108,54 @@ class KenoGame(QMainWindow):
             for child in slot.findChildren(RollingDrawnBall):
                 child.deleteLater()
 
+    def _available_bet_steps(self) -> list:
+        """Bet ladder filtered to amounts the player can afford (no hard cap)."""
+        limit = max(1, self.balance)
+        steps = [s for s in BET_STEPS if s <= limit]
+        return steps if steps else [1]
+
     def _increase_bet(self):
-        steps = [1, 2, 5, 10, 25, 50, 100]
-        idx = next((i for i, v in enumerate(steps) if v > self.bet), len(steps) - 1)
-        self.bet = min(steps[idx], self.balance)
+        steps = self._available_bet_steps()
+        higher = [s for s in steps if s > self.bet]
+        if higher:
+            self.bet = higher[0]
+        elif self.balance > self.bet:
+            # Balance sits between ladder rungs — jump to max affordable
+            self.bet = steps[-1]
         self._refresh_info()
 
     def _decrease_bet(self):
-        steps = [1, 2, 5, 10, 25, 50, 100]
-        idx = next((i for i, v in enumerate(steps) if v >= self.bet), 0) - 1
-        self.bet = steps[max(idx, 0)]
+        steps = self._available_bet_steps()
+        lower = [s for s in steps if s < self.bet]
+        self.bet = lower[-1] if lower else steps[0]
         self._refresh_info()
+
+    def _toggle_display_mode(self):
+        """Switch between credit units and cash ($0.05 / credit)."""
+        set_display_mode("cash" if DISPLAY_MODE == "credits" else "credits")
+        if hasattr(self, "mode_btn"):
+            self.mode_btn.setText("$" if DISPLAY_MODE == "cash" else "CR")
+        if hasattr(self, "balance_lbl"):
+            self.balance_lbl.setText(unit_label())
+        self._refresh_info()
+        # Force DMD panels to repaint with new formatting
+        if hasattr(self, "payout_dmd"):
+            self.payout_dmd.update()
+        if hasattr(self, "game_state_panel"):
+            self.game_state_panel.update()
+        if hasattr(self, "jackpot_strip"):
+            spots = len(self.player_picks)
+            if spots > 0:
+                self.jackpot_strip.set_jackpot(
+                    spots, jackpot_value_for_bet(self._jackpots, spots)
+                )
+            else:
+                self.jackpot_strip.set_jackpot(0, 0)
+        self._set_status(
+            f"●  DISPLAY MODE: {unit_label()} "
+            f"({'1 credit = $0.05' if DISPLAY_MODE == 'cash' else 'raw credits'})",
+            "#44aaff",
+        )
 
     def _start_draw(self):
         if self._broke or self.balance <= 0:
@@ -1968,7 +2165,7 @@ class KenoGame(QMainWindow):
             self._set_status("⚠  SELECT AT LEAST 1 NUMBER!", "#ff6633")
             return
         if self.bet > self.balance:
-            self._set_status("⚠  INSUFFICIENT CREDITS!", "#ff6633")
+            self._set_status(f"⚠  INSUFFICIENT {unit_label()}!", "#ff6633")
             return
 
         self.balance -= self.bet
@@ -2085,7 +2282,7 @@ class KenoGame(QMainWindow):
         """Pause halfway through the draw and offer a higher-risk double-up."""
         if self.balance < self.bet:
             self._set_status(
-                "●  DOUBLE UP AVAILABLE — INSUFFICIENT CREDITS TO DOUBLE BET",
+                f"●  DOUBLE UP AVAILABLE — INSUFFICIENT {unit_label()} TO DOUBLE BET",
                 "#ffaa00",
             )
             self.draw_timer.start(DRAW_INTERVAL_MS)
@@ -2210,7 +2407,7 @@ class KenoGame(QMainWindow):
             QTimer.singleShot(400, lambda: QMessageBox.information(
                 self, "★  JACKPOT!  ★",
                 f"CATCH {hits} OF {spots}\n\nYOU HIT THE PROGRESSIVE JACKPOT!\n\n"
-                f"  {format_credits(jackpot_amount)} CREDITS  \n\n"
+                f"  {format_credits(jackpot_amount)} {unit_label()}  \n\n"
                 f"Jackpot resets to {format_credits(JACKPOT_SEEDS[spots])}.",
             ))
         elif winnings > 0:
@@ -2343,7 +2540,7 @@ class KenoGame(QMainWindow):
         if play_sound:
             self._sfx.play("broke")
         self._set_status(
-            "✗  OUT OF CREDITS — PRESS REBUY TO CONTINUE",
+            f"✗  OUT OF {unit_label()} — PRESS REBUY TO CONTINUE",
             "#ff6644",
         )
         self._refresh_info()
@@ -2359,7 +2556,7 @@ class KenoGame(QMainWindow):
         self.bet = min(self.bet, self.balance)
         self._refresh_info()
         self._set_status(
-            f"●  REBUY COMPLETE — {format_credits(DEFAULT_BALANCE)} CREDITS LOADED",
+            f"●  REBUY COMPLETE — {format_credits(DEFAULT_BALANCE)} {unit_label()} LOADED",
             "#00ff66",
         )
         _save_state(self._jackpots, self.balance)
