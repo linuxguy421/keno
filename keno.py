@@ -2007,19 +2007,16 @@ class KenoGame(QMainWindow):
     def _make_action_block(self):
         v = QVBoxLayout()
         v.setSpacing(8)
+        # PLAY and REBUY share one fixed slot so CLEAR never jumps when broke.
         self.play_btn = CabinetButton("▶  PLAY", "#ffcc00", "#000000")
         self.play_btn.setFixedWidth(150)
-        self.play_btn.clicked.connect(self._start_draw)
+        self.play_btn.clicked.connect(self._on_play_or_rebuy)
         v.addWidget(self.play_btn)
         self.clear_btn = CabinetButton("CLEAR", "#4499dd", "#ffffff")
         self.clear_btn.setFixedWidth(150)
         self.clear_btn.clicked.connect(self._clear_picks)
         v.addWidget(self.clear_btn)
-        self.rebuy_btn = CabinetButton("REBUY 1K", "#ff6644", "#000000")
-        self.rebuy_btn.setFixedWidth(150)
-        self.rebuy_btn.clicked.connect(self._rebuy_credits)
-        self.rebuy_btn.setVisible(False)
-        v.addWidget(self.rebuy_btn)
+        self._play_is_rebuy = False
         return v
 
     def _small_btn(self, text, slot):
@@ -2529,14 +2526,56 @@ class KenoGame(QMainWindow):
                 except TypeError:
                     pass
 
+    def _on_play_or_rebuy(self):
+        """Top action button: PLAY normally, REBUY when broke (same slot)."""
+        if self._play_is_rebuy or self._broke:
+            self._rebuy_credits()
+        else:
+            self._start_draw()
+
+    def _style_play_button(self, rebuy: bool):
+        """Restyle the shared PLAY/REBUY button without moving CLEAR."""
+        self._play_is_rebuy = rebuy
+        if rebuy:
+            self.play_btn.setText("REBUY 1K")
+            # Match CabinetButton red accent look
+            self.play_btn.setStyleSheet("""
+                QPushButton {
+                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                        stop:0 #ff6644, stop:1 #882211);
+                    color: #000000; border: 2px solid #ff8866;
+                    border-radius: 6px; padding: 0 18px; letter-spacing: 1px;
+                }
+                QPushButton:hover {
+                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                        stop:0 #ff8866, stop:1 #ff6644);
+                }
+                QPushButton:pressed { background: #882211; }
+                QPushButton:disabled { background:#1a2a3a; color:#334455; border-color:#223344; }
+            """)
+            self.play_btn.setEnabled(True)
+        else:
+            self.play_btn.setText("▶  PLAY")
+            self.play_btn.setStyleSheet("""
+                QPushButton {
+                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                        stop:0 #ffcc00, stop:1 #886600);
+                    color: #000000; border: 2px solid #ffee88;
+                    border-radius: 6px; padding: 0 18px; letter-spacing: 1px;
+                }
+                QPushButton:hover {
+                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                        stop:0 #ffee66, stop:1 #ffcc00);
+                }
+                QPushButton:pressed { background: #886600; }
+                QPushButton:disabled { background:#1a2a3a; color:#334455; border-color:#223344; }
+            """)
+
     def _enter_broke_state(self, play_sound: bool = True):
-        """Player is out of credits — disable play and offer a rebuy."""
+        """Player is out of credits — top button becomes REBUY; CLEAR stays put."""
         self._broke = True
         self.balance = 0
-        self.play_btn.setEnabled(False)
-        self.play_btn.setVisible(False)
-        self.rebuy_btn.setVisible(True)
-        self.rebuy_btn.setEnabled(True)
+        self._style_play_button(rebuy=True)
         if play_sound:
             self._sfx.play("broke")
         self._set_status(
@@ -2550,8 +2589,7 @@ class KenoGame(QMainWindow):
         """Grant a fresh stack of credits after going broke."""
         self.balance = DEFAULT_BALANCE
         self._broke = False
-        self.rebuy_btn.setVisible(False)
-        self.play_btn.setVisible(True)
+        self._style_play_button(rebuy=False)
         self.play_btn.setEnabled(True)
         self.bet = min(self.bet, self.balance)
         self._refresh_info()
