@@ -66,6 +66,7 @@ class SoundEngine:
         self._rr: dict[str, int] = {}
         self._paths: dict[str, str] = {}
         self._enabled = True
+        self._muted = False
         self._backend = "none"   # "qt" | "cli" | "none"
         self._cli_player: list[str] | None = None
         try:
@@ -276,8 +277,14 @@ class SoundEngine:
                 return True
         return False
 
+    def set_muted(self, muted: bool) -> None:
+        self._muted = bool(muted)
+
+    def is_muted(self) -> bool:
+        return self._muted
+
     def play(self, name: str):
-        if not self._enabled:
+        if not self._enabled or self._muted:
             return
         path = self._paths.get(name)
         if not path:
@@ -480,6 +487,11 @@ BALL_THEME = {
     "selected": ("#ffcc00", "#e08800", "#ffee44", "#000000", "#ffdd00"),
     "hit": ("#00dd55", "#009933", "#44ff88", "#ffffff", "#00ff66"),
     "drawn_miss": ("#3a0a0a", "#200505", "#cc2222", "#ff4444", "#dd0000"),
+    # Jackpot celebration cycle (gold → cyan → magenta → white)
+    "jackpot_a": ("#ffdd33", "#cc8800", "#ffee88", "#000000", "#ffcc00"),
+    "jackpot_b": ("#00e8ff", "#0066aa", "#88f0ff", "#003344", "#00ccff"),
+    "jackpot_c": ("#ff44cc", "#990066", "#ff99ee", "#ffffff", "#ff66dd"),
+    "jackpot_d": ("#ffffff", "#cccccc", "#ffffff", "#000000", "#ffffff"),
 }
 
 
@@ -957,6 +969,28 @@ class JackpotStrip(DmdPanel):
         self._roll_timer = QTimer(self)
         self._roll_timer.timeout.connect(self._tick_roll)
 
+    def celebrate_jackpot(self, spots: int, amount: int):
+        """Full jackpot celebration on the strip (strong multi-flash)."""
+        self._spots = spots
+        self._value = amount
+        self._display_value = amount
+        self._celeb_left = 24
+        if not hasattr(self, "_celeb_timer"):
+            self._celeb_timer = QTimer(self)
+            self._celeb_timer.timeout.connect(self._tick_celeb)
+        self._flash = True
+        self._tick_pulse = False
+        self._celeb_timer.start(140)
+        self.update()
+
+    def _tick_celeb(self):
+        self._celeb_left = getattr(self, "_celeb_left", 0) - 1
+        self._flash = (self._celeb_left % 2 == 0)
+        if self._celeb_left <= 0:
+            self._celeb_timer.stop()
+            self._flash = False
+        self.update()
+
     def set_jackpot(self, spots: int, value: int, flash: bool = False, tick: bool = False):
         self._spots = spots
         changed = value != self._value
@@ -1050,7 +1084,11 @@ class JackpotStrip(DmdPanel):
                 oc, gc, max_col=max_c, max_row=max_r,
             )
 
-        if self._spots > 0:
+        celebrating = getattr(self, "_celeb_left", 0) > 0
+        if celebrating:
+            blit("JACKPOT!", 2, 1, on_val, glow_val)
+            blit(format_credits(self._display_value), 11, 2, on_val, glow_val)
+        elif self._spots > 0:
             # Compact label — always fits at scale 1 in 56 cols
             blit(f"{self._spots}-SPOT JP", 2, 1, on_lbl, glow_lbl)
             blit(format_credits(self._display_value), 11, 2, on_val, glow_val)
@@ -1088,7 +1126,8 @@ class GameStatePanel(DmdPanel):
         self._mode: str = "idle"   # "idle" | "draw" | "result"
 
         # ── Result mode ──────────────────────────────────────────────────
-        self._result_win:    int  = 0
+        self._result_win:     int  = 0
+        self._result_jackpot: bool = False
         self._result_timer = QTimer(self)
         self._result_timer.setSingleShot(True)
         self._result_timer.timeout.connect(self._end_result)
@@ -1130,10 +1169,11 @@ class GameStatePanel(DmdPanel):
             self._hits += 1
         self.update()
 
-    def show_result(self, winnings: int):
+    def show_result(self, winnings: int, jackpot: bool = False):
         self._mode       = "result"
         self._result_win = winnings
-        self._result_timer.start(2500)
+        self._result_jackpot = jackpot
+        self._result_timer.start(4000 if jackpot else 2500)
         if winnings > 0:
             self._flicker_phase = 0.0
             self._flicker_timer.start(self._FLICKER_MS)
@@ -1147,6 +1187,7 @@ class GameStatePanel(DmdPanel):
 
     def _end_result(self):
         self._mode = "idle"
+        self._result_jackpot = False
         self._flicker_timer.stop()
         self._set_instant(self._balance)
         self.update()
@@ -1321,9 +1362,21 @@ class GameStatePanel(DmdPanel):
 
         # ──────────────────────────────────────────────────────────────────
         elif self._mode == "result":
-            if self._result_win > 0:
-                # Flicker-boosted green win
-                pulse = 0.85 + 0.15 * abs(__import__("math").sin(self._flicker_phase))
+            if getattr(self, "_result_jackpot", False) and self._result_win > 0:
+                pulse = 0.80 + 0.20 * abs(math.sin(self._flicker_phase))
+                phase = int(self._flicker_phase * 3) % 3
+                jp_col = (self._rgb("gold"), self._rgb("cyan"), self._rgb("magenta"))[phase]
+                jp_on = self._scale_bri(jp_col, pulse)
+                jp_glow = QColor(jp_on)
+                jp_glow.setAlpha(int(150 * pulse))
+                centre("JACKPOT!", 2, oc=jp_on, gc=jp_glow)
+                divider(10)
+                win_str = format_credits(self._result_win)
+                ww = self._text_width(win_str, 2, 1)
+                txt(win_str, max(0, (cols - ww) // 2), 13, 2, 1, jp_on, jp_glow)
+                centre(unit_label(), 27, oc=lbl_on, gc=lbl_glow)
+            elif self._result_win > 0:
+                pulse = 0.85 + 0.15 * abs(math.sin(self._flicker_phase))
                 win_on   = self._scale_bri(self._rgb("green"), pulse)
                 win_glow = QColor(0, 255, 100, int(120 * pulse))
                 centre("WIN", 2, oc=win_on, gc=win_glow)
@@ -1368,6 +1421,7 @@ class PayoutDMD(DmdPanel):
         self._balance:      int  = 0
         self._draws_done:   int  = 0
         self._draws_total:  int  = 20
+        self._result_jackpot: bool = False
 
         # ── DRAW mode ────────────────────────────────────────────────────
         self._in_draw: bool = False
@@ -1428,7 +1482,8 @@ class PayoutDMD(DmdPanel):
         self.update()
 
     def show_result(self, rounds: int, total_won: int, best_win: int,
-                    last_hits: int = 0, last_spots: int = 0, last_win: int = 0):
+                    last_hits: int = 0, last_spots: int = 0, last_win: int = 0,
+                    jackpot: bool = False):
         self._in_result   = True
         self._in_draw     = False
         self._sess_rounds = rounds
@@ -1437,6 +1492,7 @@ class PayoutDMD(DmdPanel):
         self._last_hits   = last_hits
         self._last_spots  = last_spots
         self._last_win    = last_win
+        self._result_jackpot = jackpot
         self._result_timer.start(3500)
         self.update()
 
@@ -1535,35 +1591,54 @@ class PayoutDMD(DmdPanel):
 
         # ──────────────────────────────────────────────────────────────────
         if self._in_result:
-            centre("SESSION STATS", 1, oc=cyan, gc=lbl_glow)
-            divider(9)
-
-            stat_area_start = 11
-            stat_area_end   = rows - 14
-            stat_h          = (stat_area_end - stat_area_start) // 3
-            stats = [
-                ("ROUNDS", str(self._sess_rounds)),
-                ("TOTAL",  format_credits(self._sess_total)),
-                ("BEST",   format_credits(self._sess_best)),
-            ]
-            for i, (lbl, val) in enumerate(stats):
-                dr = stat_area_start + i * stat_h
-                txt(lbl, 2, dr, 1, 1, lbl_on, lbl_glow)
-                right(val, dr + 2, 2, 1, green if i == 0 else (gold if i == 2 else amber),
-                      glow_col if i == 0 else hi_glow)
-                if i < 2:
-                    divider(dr + stat_h - 1)
-
-            divider(rows - 12)
-            if self._last_spots > 0:
-                result_str = f"CATCH {self._last_hits}/{self._last_spots}"
+            if getattr(self, "_result_jackpot", False):
+                pulse = 0.75 + 0.25 * abs(math.sin(self._breathe_phase * 2))
+                phase = int(self._breathe_phase * 4) % 3
+                jp_col = (self._rgb("gold"), self._rgb("cyan"), self._rgb("magenta"))[phase]
+                jp_on = self._scale_bri(jp_col, pulse)
+                jp_glow = QColor(jp_on)
+                jp_glow.setAlpha(int(160 * pulse))
+                centre("JACKPOT!", 1, sc=2, oc=jp_on, gc=jp_glow)
+                divider(16)
                 if self._last_win > 0:
-                    centre(result_str, rows - 10, oc=win_on, gc=win_glow)
-                    centre(f"+{format_credits(self._last_win)}", rows - 3, oc=hi_on, gc=hi_glow)
-                else:
-                    centre(result_str, rows - 8, oc=dim_on, gc=dim_glow)
+                    centre(format_credits(self._last_win), 18, sc=2, oc=jp_on, gc=jp_glow)
+                centre(unit_label(), 32, oc=lbl_on, gc=lbl_glow)
+                divider(40)
+                txt("ROUNDS", 2, 44, 1, 1, lbl_on, lbl_glow)
+                right(str(self._sess_rounds), 44, 1, 1, green, glow_col)
+                txt("TOTAL", 2, 54, 1, 1, lbl_on, lbl_glow)
+                right(format_credits(self._sess_total), 54, 1, 1, amber, hi_glow)
+                txt("BEST", 2, 64, 1, 1, lbl_on, lbl_glow)
+                right(format_credits(self._sess_best), 64, 1, 1, gold, hi_glow)
+            else:
+                centre("SESSION STATS", 1, oc=cyan, gc=lbl_glow)
+                divider(9)
 
-        # ──────────────────────────────────────────────────────────────────
+                stat_area_start = 11
+                stat_area_end   = rows - 14
+                stat_h          = (stat_area_end - stat_area_start) // 3
+                stats = [
+                    ("ROUNDS", str(self._sess_rounds)),
+                    ("TOTAL",  format_credits(self._sess_total)),
+                    ("BEST",   format_credits(self._sess_best)),
+                ]
+                for i, (lbl, val) in enumerate(stats):
+                    dr = stat_area_start + i * stat_h
+                    txt(lbl, 2, dr, 1, 1, lbl_on, lbl_glow)
+                    right(val, dr + 2, 2, 1, green if i == 0 else (gold if i == 2 else amber),
+                          glow_col if i == 0 else hi_glow)
+                    if i < 2:
+                        divider(dr + stat_h - 1)
+
+                divider(rows - 12)
+                if self._last_spots > 0:
+                    result_str = f"CATCH {self._last_hits}/{self._last_spots}"
+                    if self._last_win > 0:
+                        centre(result_str, rows - 10, oc=win_on, gc=win_glow)
+                        centre(f"+{format_credits(self._last_win)}", rows - 3, oc=hi_on, gc=hi_glow)
+                    else:
+                        centre(result_str, rows - 8, oc=dim_on, gc=dim_glow)
+
         elif self._in_draw:
             hdr = f"PICK {self._spots}  BET {self._bet}"
             if self._prize_mult > 1:
@@ -1763,6 +1838,10 @@ class KenoGame(QMainWindow):
         self.draw_timer = QTimer()
         self.draw_timer.timeout.connect(self._reveal_next)
         self.win_count_timer = QTimer()
+        self._jp_celeb_timer = QTimer(self)
+        self._jp_celeb_timer.timeout.connect(self._tick_jackpot_celebration)
+        self._jp_celeb_step = 0
+        self._jp_celeb_left = 0
         self._jackpot_tick_count = 0
         self.jackpot_drip_timer = QTimer(self)
         self.jackpot_drip_timer.setInterval(JACKPOT_TICK_MS)
@@ -1935,49 +2014,80 @@ class KenoGame(QMainWindow):
         return wrap
 
     def _make_credit_block(self):
+        """Balance + winnings meters, with a clean options strip underneath."""
         v = QVBoxLayout()
-        v.setSpacing(4)
+        v.setSpacing(6)
 
-        label_row = QHBoxLayout()
-        label_row.setSpacing(8)
+        # ── Meters: BALANCE | WINNINGS ──────────────────────────────────
+        meters = QHBoxLayout()
+        meters.setSpacing(10)
 
+        bal_col = QVBoxLayout()
+        bal_col.setSpacing(2)
         self.balance_lbl = QLabel(unit_label())
         self.balance_lbl.setFont(QFont("Arial", 8, QFont.Weight.Bold))
         self.balance_lbl.setStyleSheet(
-            "color: #336688; letter-spacing: 3px; background:transparent;"
+            "color: #336688; letter-spacing: 3px; background: transparent;"
         )
-        label_row.addWidget(self.balance_lbl)
+        bal_col.addWidget(self.balance_lbl)
+        self.credit_display = DigitalLabel(format_credits(1000))
+        self.credit_display.setFixedWidth(160)
+        bal_col.addWidget(self.credit_display)
+        meters.addLayout(bal_col)
 
-        self.mode_btn = self._small_btn("CR", self._toggle_display_mode)
-        self.mode_btn.setToolTip("Toggle Credits / Cash ($0.05 per credit)")
-        self.mode_btn.setFixedWidth(36)
-        label_row.addWidget(self.mode_btn)
-        label_row.addStretch(1)
-
+        win_col = QVBoxLayout()
+        win_col.setSpacing(2)
         win_lbl = QLabel("WINNINGS")
         win_lbl.setFont(QFont("Arial", 8, QFont.Weight.Bold))
         win_lbl.setStyleSheet(
-            "color: #336688; letter-spacing: 3px; background:transparent;"
+            "color: #336688; letter-spacing: 3px; background: transparent;"
         )
-        label_row.addWidget(win_lbl)
-        v.addLayout(label_row)
-
-        display_row = QHBoxLayout()
-        display_row.setSpacing(8)
-
-        self.credit_display = DigitalLabel(format_credits(1000))
-        self.credit_display.setFixedWidth(160)
-        display_row.addWidget(self.credit_display)
-
+        win_col.addWidget(win_lbl)
         self.winnings_display = DigitalLabel(format_winnings(0))
         self.winnings_display.setFixedWidth(150)
         self.winnings_display.setStyleSheet("""
             color: #336688; background: #000a14;
             border: 2px solid #1a4a7a; border-radius: 4px; padding: 4px 12px;
         """)
-        display_row.addWidget(self.winnings_display)
+        win_col.addWidget(self.winnings_display)
+        meters.addLayout(win_col)
+        meters.addStretch(1)
+        v.addLayout(meters)
 
-        v.addLayout(display_row)
+        # ── Options strip: MODE + SOUND ─────────────────────────────────
+        opts = QHBoxLayout()
+        opts.setSpacing(12)
+
+        mode_wrap = QHBoxLayout()
+        mode_wrap.setSpacing(4)
+        mode_cap = QLabel("MODE")
+        mode_cap.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+        mode_cap.setStyleSheet(
+            "color: #2a4a66; letter-spacing: 2px; background: transparent;"
+        )
+        mode_wrap.addWidget(mode_cap)
+        self.mode_btn = self._small_btn("CR", self._toggle_display_mode)
+        self.mode_btn.setToolTip("Credits or Cash ($0.05 per credit)")
+        self.mode_btn.setFixedWidth(40)
+        mode_wrap.addWidget(self.mode_btn)
+        opts.addLayout(mode_wrap)
+
+        sound_wrap = QHBoxLayout()
+        sound_wrap.setSpacing(4)
+        sound_cap = QLabel("SOUND")
+        sound_cap.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+        sound_cap.setStyleSheet(
+            "color: #2a4a66; letter-spacing: 2px; background: transparent;"
+        )
+        sound_wrap.addWidget(sound_cap)
+        self.mute_btn = self._small_btn("♪", self._toggle_mute)
+        self.mute_btn.setToolTip("Mute / unmute sound effects")
+        self.mute_btn.setFixedWidth(40)
+        sound_wrap.addWidget(self.mute_btn)
+        opts.addLayout(sound_wrap)
+
+        opts.addStretch(1)
+        v.addLayout(opts)
         return v
 
     def _make_bet_block(self):
@@ -2058,9 +2168,7 @@ class KenoGame(QMainWindow):
         self.game_state_panel.set_balance(self.balance)
         self.jackpot_strip.set_jackpot(n, jp_val)
         if self.balance > 0 and self.bet > self.balance:
-            # Snap to largest ladder step the player can still afford
-            steps = [s for s in BET_STEPS if s <= self.balance]
-            self.bet = steps[-1] if steps else 1
+            self._clamp_bet_to_balance()
             self.bet_display.setText(format_credits(self.bet))
 
     def _toggle_pick(self, number: int):
@@ -2119,6 +2227,15 @@ class KenoGame(QMainWindow):
         steps = [s for s in BET_STEPS if s <= limit]
         return steps if steps else [1]
 
+    def _clamp_bet_to_balance(self) -> None:
+        """Ensure self.bet never exceeds remaining credits (nearest ladder step)."""
+        if self.balance <= 0:
+            self.bet = 1
+            return
+        if self.bet > self.balance:
+            steps = self._available_bet_steps()
+            self.bet = steps[-1] if steps else 1
+
     def _increase_bet(self):
         # Stake is locked for the whole round (draw + double-up pause)
         if getattr(self, "_round_active", False):
@@ -2140,8 +2257,22 @@ class KenoGame(QMainWindow):
         self.bet = lower[-1] if lower else steps[0]
         self._refresh_info()
 
+    def _toggle_mute(self):
+        """Mute or unmute all game sound effects."""
+        muted = not self._sfx.is_muted()
+        self._sfx.set_muted(muted)
+        if hasattr(self, "mute_btn"):
+            self.mute_btn.setText("✕" if muted else "♪")
+            self.mute_btn.setToolTip(
+                "Unmute sound effects" if muted else "Mute sound effects"
+            )
+        self._set_status(
+            "●  SOUND OFF" if muted else "●  SOUND ON",
+            "#6688aa" if muted else "#44aaff",
+        )
+
     def _toggle_display_mode(self):
-        """Switch between credit units and cash ($0.05 / credit)."""
+        """Switch between credit units and cash ($0.05 per credit)."""
         set_display_mode("cash" if DISPLAY_MODE == "credits" else "credits")
         if hasattr(self, "mode_btn"):
             self.mode_btn.setText("$" if DISPLAY_MODE == "cash" else "CR")
@@ -2205,6 +2336,8 @@ class KenoGame(QMainWindow):
         self.random_pick_btn.setEnabled(False)
         self.bet_plus.setEnabled(False)
         self.bet_minus.setEnabled(False)
+        if self._jp_celeb_timer.isActive():
+            self._jp_celeb_timer.stop()
 
         self._reset_board_display()
         for n in self.player_picks:
@@ -2314,9 +2447,17 @@ class KenoGame(QMainWindow):
         )
 
     def _accept_double_up(self):
+        # Re-check funds (balance may have changed); abort cleanly if short
+        if self.balance < self.bet:
+            self._set_status(
+                f"●  DOUBLE UP CANCELLED — INSUFFICIENT {unit_label()}",
+                "#ffaa00",
+            )
+            self.draw_timer.start(DRAW_INTERVAL_MS)
+            return
         self._bet_before_double_up = self.bet
-        self.balance -= self.bet
-        self.bet *= 2
+        self.balance -= self.bet          # second stake
+        self.bet *= 2                     # display / paytable stake for this round only
         self._double_up_active = True
         self.credit_display.setText(format_credits(self.balance))
         self.bet_display.setText(format_credits(self.bet))
@@ -2371,6 +2512,8 @@ class KenoGame(QMainWindow):
 
         if self._double_up_active:
             self.bet = self._bet_before_double_up
+        # After losses (and especially double-up), stake may exceed remaining credits
+        self._clamp_bet_to_balance()
 
         self.credit_display.setText(format_credits(self.balance))
         self.bet_display.setText(format_credits(self.bet))
@@ -2379,8 +2522,8 @@ class KenoGame(QMainWindow):
             f"color: {'#ffcc00' if spots > 0 else '#88aacc'}; background: transparent;"
         )
 
-        # Show WIN/NO WIN on the game state panel
-        self.game_state_panel.show_result(winnings)
+        # Show WIN/NO WIN / JACKPOT on the game state panel
+        self.game_state_panel.show_result(winnings, jackpot=jackpot_win)
 
         self._start_winnings_count(winnings)
 
@@ -2399,19 +2542,14 @@ class KenoGame(QMainWindow):
         )
         # Show session stats for 3.5 s after the round
         self.payout_dmd.show_result(self._sess_rounds, self._sess_total, self._sess_best,
-                                    hits, spots, winnings)
-
+                                    hits, spots, winnings, jackpot=jackpot_win)
 
         if jackpot_win:
             msg = f"★★  JACKPOT!  CATCH {hits}  —  {format_credits(jackpot_amount)}  ★★"
             color = "#ffdd33"
             self._sfx.play("jackpot_fanfare")
-            QTimer.singleShot(400, lambda: QMessageBox.information(
-                self, "★  JACKPOT!  ★",
-                f"CATCH {hits} OF {spots}\n\nYOU HIT THE PROGRESSIVE JACKPOT!\n\n"
-                f"  {format_credits(jackpot_amount)} {unit_label()}  \n\n"
-                f"Jackpot resets to {format_credits(JACKPOT_SEEDS[spots])}.",
-            ))
+            self._start_jackpot_celebration()
+            self.jackpot_strip.celebrate_jackpot(spots, jackpot_amount)
         elif winnings > 0:
             if win_multiplier > 1:
                 msg = f"★  {hits} OF {spots} — DOUBLE UP WIN  {format_credits(winnings)}  (3×)  ★"
@@ -2506,6 +2644,34 @@ class KenoGame(QMainWindow):
             f"color: {color}; background: #040c18; padding: 5px 14px;"
             "border-top: 1px solid #1a3a6a; font-weight: bold;"
         )
+
+    def _start_jackpot_celebration(self):
+        """Cycle winning balls through gold/cyan/magenta/white for a few seconds."""
+        self._jp_celeb_timer.stop()
+        self._jp_celeb_step = 0
+        self._jp_celeb_left = 28   # ~3.4 s at 120 ms
+        self._tick_jackpot_celebration()
+        self._jp_celeb_timer.start(120)
+
+    def _tick_jackpot_celebration(self):
+        if self._jp_celeb_left <= 0:
+            self._jp_celeb_timer.stop()
+            # Restore hit state on winning picks
+            for n in self.player_picks:
+                if n in self.balls:
+                    self.balls[n].set_state("hit")
+            return
+        palette = ("jackpot_a", "jackpot_b", "jackpot_c", "jackpot_d")
+        state = palette[self._jp_celeb_step % len(palette)]
+        # Flash every ball on the board lightly, emphasize winning picks
+        for n, ball in self.balls.items():
+            if n in self.player_picks:
+                ball.set_state(state)
+            elif self._jp_celeb_step % 2 == 0 and ball._state in ("drawn_miss", "default"):
+                # Subtle pulse on non-hits every other frame
+                pass
+        self._jp_celeb_step += 1
+        self._jp_celeb_left -= 1
 
     def _drip_jackpots(self):
         """Time-based progressive growth: +1 to every tier on a steady cadence.
