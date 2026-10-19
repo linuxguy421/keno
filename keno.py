@@ -1788,6 +1788,7 @@ class KenoGame(QMainWindow):
         self._sess_total:  int = 0
         self._sess_best:   int = 0
         self._broke = self.balance <= 0
+        self._round_active = False
 
         self._build_ui()
         self._refresh_info()
@@ -2024,9 +2025,16 @@ class KenoGame(QMainWindow):
         btn.setFixedSize(32, 32)
         btn.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         btn.setStyleSheet("""
-            QPushButton { background:#0d2040; color:#ffcc00; border:2px solid #1a4a7a; border-radius:4px; }
-            QPushButton:hover { background:#1a3a6a; }
-            QPushButton:pressed { background:#091528; }
+            QPushButton {
+                background: #0d2040; color: #ffcc00;
+                border: 2px solid #1a4a7a; border-radius: 4px;
+            }
+            QPushButton:hover { background: #1a3a6a; }
+            QPushButton:pressed { background: #091528; }
+            QPushButton:disabled {
+                background: #060c18; color: #3a4a5a;
+                border: 2px solid #152030;
+            }
         """)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.clicked.connect(slot)
@@ -2112,6 +2120,9 @@ class KenoGame(QMainWindow):
         return steps if steps else [1]
 
     def _increase_bet(self):
+        # Stake is locked for the whole round (draw + double-up pause)
+        if getattr(self, "_round_active", False):
+            return
         steps = self._available_bet_steps()
         higher = [s for s in steps if s > self.bet]
         if higher:
@@ -2122,6 +2133,8 @@ class KenoGame(QMainWindow):
         self._refresh_info()
 
     def _decrease_bet(self):
+        if getattr(self, "_round_active", False):
+            return
         steps = self._available_bet_steps()
         lower = [s for s in steps if s < self.bet]
         self.bet = lower[-1] if lower else steps[0]
@@ -2166,6 +2179,7 @@ class KenoGame(QMainWindow):
             return
 
         self.balance -= self.bet
+        self._round_active = True
         spots = len(self.player_picks)
         total_contrib = max(1, int(self.bet * JACKPOT_CONTRIB))
         primary = max(1, int(total_contrib * JACKPOT_PRIMARY_SHARE))
@@ -2189,6 +2203,8 @@ class KenoGame(QMainWindow):
         self.play_btn.setEnabled(False)
         self.clear_btn.setEnabled(False)
         self.random_pick_btn.setEnabled(False)
+        self.bet_plus.setEnabled(False)
+        self.bet_minus.setEnabled(False)
 
         self._reset_board_display()
         for n in self.player_picks:
@@ -2322,6 +2338,7 @@ class KenoGame(QMainWindow):
         self.draw_timer.start(DRAW_INTERVAL_MS)
 
     def _finish_round(self):
+        self._round_active = False
         drawn_set = set(self.drawn_numbers)
         hits = len(self.player_picks & drawn_set)
         spots = len(self.player_picks)
@@ -2332,32 +2349,20 @@ class KenoGame(QMainWindow):
         final_table_multiplier = 3 if self._double_up_active else 1
         final_table_jackpot    = jackpot_value_for_bet(self._jackpots, spots)
 
-        # Jackpot: full catch on any pick count wins the progressive pot.
-        # Hard rule: jackpot never pays less than the best fixed prize for this
-        # ticket (full-catch mult if present, otherwise the next-lower catch),
-        # scaled by bet and double-up. Seeds are sized for max bet, but the
-        # floor still protects mid-growth / high-bet edge cases.
+        # Jackpot: full catch wins the progressive pot for that pick count.
+        # Payout is exactly the displayed pot (×3 if double-up is active).
+        # No floor uplift — that was overpaying vs the meter on 1–3 spot tickets
+        # whenever fixed_mult × bet exceeded the pot.
         jackpot_win    = (hits == spots) and (spots in self._jackpots)
         jackpot_amount = 0
         win_multiplier = 3 if self._double_up_active else 1
         if jackpot_win:
-            table = PAYOUTS.get(spots, {})
-            # Fixed full-catch mult (0 on progressive-only rows 7-10)
-            full_mult = table.get(spots, 0)
-            if full_mult > 0:
-                floor_mult = full_mult
-            else:
-                # Best non-full catch on this ticket
-                floor_mult = max((m for h, m in table.items() if h < spots), default=0)
-            floor = floor_mult * self.bet * win_multiplier
-            # Double-up multiplies the pot as advertised in the overlay
-            pot_payout = final_table_jackpot * win_multiplier
-            jackpot_amount = max(pot_payout, floor)
+            jackpot_amount = final_table_jackpot * win_multiplier
             self._jackpots[spots] = JACKPOT_SEEDS[spots]   # reset to seed
             _save_state(self._jackpots, self.balance)
             final_table_jackpot = JACKPOT_SEEDS[spots]
 
-        # Fixed-pay tiers: multiplier × bet (jackpot catch row is 0 in table)
+        # Fixed-pay tiers: multiplier × bet (full-catch row zeroed on jackpot win)
         payout_mult = PAYOUTS.get(spots, {}).get(hits, 0)
         if jackpot_win:
             payout_mult = 0
@@ -2421,15 +2426,18 @@ class KenoGame(QMainWindow):
             color = "#ff4444"
 
         self._set_status(msg, color)
-        self.play_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)
         self.random_pick_btn.setEnabled(True)
+        self.bet_plus.setEnabled(True)
+        self.bet_minus.setEnabled(True)
         self.jackpot_strip.set_jackpot(
             spots, jackpot_value_for_bet(self._jackpots, spots)
         )
 
         if self.balance <= 0:
             self._enter_broke_state(play_sound=True)
+        else:
+            self.play_btn.setEnabled(True)
 
     def _reset_winnings_indicator(self):
         self.win_count_timer.stop()
