@@ -22,3 +22,24 @@
          v.addLayout(row)
          self.picks_display = QLabel("PICKS: 0 / 10")
          self.picks_display.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+@@ -2127,6 +2135,11 @@
+         self.clear_btn.setFixedWidth(150)
+         self.clear_btn.clicked.connect(self._clear_picks)
+         v.addWidget(self.clear_btn)
++        self.auto_btn = CabinetButton("AUTO", "#6688aa", "#ffffff")
++        self.auto_btn.setFixedWidth(150)
++        self.auto_btn.setToolTip("Auto-play: wait 3s after settle, then play again")
++        self.auto_btn.clicked.connect(self._toggle_auto)
++        v.addWidget(self.auto_btn)
+         self._play_is_rebuy = False
+         return v
+ 
+@@ -2201,6 +2214,8 @@
+     def _clear_picks(self):
+         if self.draw_timer.isActive():
+             return
++        if getattr(self, "_auto_play", False):
++            self._stop_auto("PICKS CLEARED \u2014 AUTO OFF")
+         for n in list(self.player_picks):
+             self.balls[n].set_state("idle")
+         self.player_picks.clear()
