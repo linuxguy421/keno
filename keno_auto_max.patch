@@ -1,0 +1,24 @@
+--- a/keno.py
++++ b/keno.py
+@@ -1868,6 +1868,10 @@
+         self._sess_best:   int = 0
+         self._broke = self.balance <= 0
+         self._round_active = False
++        self._auto_play = False
++        self._auto_timer = QTimer(self)
++        self._auto_timer.setSingleShot(True)
++        self._auto_timer.timeout.connect(self._auto_play_tick)
+ 
+         self._build_ui()
+         self._refresh_info()
+@@ -2108,6 +2112,10 @@
+         row.addWidget(self.bet_display)
+         self.bet_plus = self._small_btn("\u25b6", self._increase_bet)
+         row.addWidget(self.bet_plus)
++        self.bet_max = self._small_btn("MAX", self._set_max_bet)
++        self.bet_max.setFixedWidth(44)
++        self.bet_max.setToolTip("Set bet to maximum you can afford")
++        row.addWidget(self.bet_max)
+         v.addLayout(row)
+         self.picks_display = QLabel("PICKS: 0 / 10")
+         self.picks_display.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
